@@ -17,15 +17,19 @@ from django.db.models import Count
 from django.db.models.functions import TruncDate
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
 from .models import (
     BlacklistUser,
+    ChatMessage,
+    EngineCommand,
     FilterRule,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    TelegramDialog,
     TelegramGroup,
     UserBot,
 )
@@ -336,3 +340,175 @@ def toggle_group(request, group_id: int):
 def delete_userbot(request, bot_id: int):
     get_object_or_404(UserBot, pk=bot_id).delete()
     return redirect("agents:userbots")
+
+
+
+# --------------------------------------------------------------------------- #
+#  Telegram-like chat browser
+# --------------------------------------------------------------------------- #
+_DIALOG_FILTERS = {
+    "all": "All chats",
+    "private": "Users",
+    "bot": "Bots",
+    "group": "Groups",
+    "channel": "Channels",
+    "admin": "Admin groups",
+}
+
+
+def _selected_bot(request):
+    """Resolve the userbot whose chats we are browsing (?bot=<id>)."""
+    bots = UserBot.objects.all()
+    bot_id = request.GET.get("bot")
+    bot = None
+    if bot_id:
+        bot = bots.filter(pk=bot_id).first()
+    if bot is None:
+        bot = bots.filter(status=UserBot.Status.ACTIVE).first() or bots.first()
+    return bot, bots
+
+
+@login_required
+def chats_page(request):
+    bot, bots = _selected_bot(request)
+    flt = request.GET.get("filter", "all")
+    if flt not in _DIALOG_FILTERS:
+        flt = "all"
+
+    dialogs = TelegramDialog.objects.none()
+    counts = {}
+    if bot:
+        base = TelegramDialog.objects.filter(userbot=bot)
+        counts = {
+            "all": base.count(),
+            "private": base.filter(dialog_type="private").count(),
+            "bot": base.filter(dialog_type="bot").count(),
+            "group": base.filter(dialog_type__in=["group", "supergroup"]).count(),
+            "channel": base.filter(dialog_type="channel").count(),
+            "admin": base.filter(is_admin=True).count(),
+        }
+        if flt == "group":
+            dialogs = base.filter(dialog_type__in=["group", "supergroup"])
+        elif flt == "admin":
+            dialogs = base.filter(is_admin=True)
+        elif flt == "all":
+            dialogs = base
+        else:
+            dialogs = base.filter(dialog_type=flt)
+
+    ctx = {
+        "active": "chats",
+        "bot": bot,
+        "bots": bots,
+        "dialogs": dialogs,
+        "filter": flt,
+        "filters": _DIALOG_FILTERS,
+        "counts": counts,
+    }
+    return render(request, "agents/chats.html", ctx)
+
+
+@login_required
+def chat_messages_page(request, bot_id: int, chat_id: int):
+    bot = get_object_or_404(UserBot, pk=bot_id)
+    dialog = TelegramDialog.objects.filter(userbot=bot, chat_id=chat_id).first()
+    ctx = {
+        "active": "chats",
+        "bot": bot,
+        "dialog": dialog,
+        "chat_id": chat_id,
+    }
+    return render(request, "agents/chat_messages.html", ctx)
+
+
+@login_required
+@require_POST
+def sync_chats(request, bot_id: int):
+    bot = get_object_or_404(UserBot, pk=bot_id)
+    EngineCommand.objects.create(userbot=bot, kind=EngineCommand.Kind.SYNC_DIALOGS)
+    messages.success(
+        request,
+        "Chat-list sync queued. The engine (run_agents) will refresh it shortly.",
+    )
+    return redirect(f"{reverse('agents:chats')}?bot={bot.id}")
+
+
+@login_required
+@require_POST
+def fetch_history(request, bot_id: int, chat_id: int):
+    bot = get_object_or_404(UserBot, pk=bot_id)
+    limit = int(request.POST.get("limit", 50) or 50)
+    EngineCommand.objects.create(
+        userbot=bot,
+        kind=EngineCommand.Kind.FETCH_HISTORY,
+        chat_id=chat_id,
+        limit=max(1, min(limit, 200)),
+    )
+    messages.success(request, "Message fetch queued. Refreshing shortly...")
+    return redirect("agents:chat_messages", bot_id=bot.id, chat_id=chat_id)
+
+
+@login_required
+@require_POST
+def toggle_antispam(request, dialog_id: int):
+    """Enable/disable anti-spam monitoring for a group (takes effect live)."""
+    dialog = get_object_or_404(TelegramDialog, pk=dialog_id)
+    if not dialog.is_group:
+        messages.error(request, "Anti-spam can only be enabled on groups.")
+        return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter=group")
+
+    if dialog.monitored:
+        TelegramGroup.objects.filter(
+            monitored_by=dialog.userbot, chat_id=dialog.chat_id
+        ).update(is_active=False)
+        dialog.monitored = False
+        messages.info(request, f"Anti-spam disabled for {dialog.title or dialog.chat_id}.")
+    else:
+        TelegramGroup.objects.update_or_create(
+            monitored_by=dialog.userbot,
+            chat_id=dialog.chat_id,
+            defaults={"title": dialog.title, "is_active": True},
+        )
+        dialog.monitored = True
+        messages.success(request, f"Anti-spam enabled for {dialog.title or dialog.chat_id}.")
+    dialog.save(update_fields=["monitored"])
+    return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter={request.GET.get('filter', 'group')}")
+
+
+# --------------------------------------------------------------------------- #
+#  JSON: chat browser live data
+# --------------------------------------------------------------------------- #
+@login_required
+def api_command_status(request):
+    """Latest command status for a bot (so the UI can show 'syncing...')."""
+    bot_id = request.GET.get("bot")
+    cmd = (
+        EngineCommand.objects.filter(userbot_id=bot_id).order_by("-created_at").first()
+        if bot_id
+        else None
+    )
+    if not cmd:
+        return JsonResponse({"status": "none"})
+    return JsonResponse(
+        {"kind": cmd.kind, "status": cmd.status, "result": cmd.result}
+    )
+
+
+@login_required
+def api_messages(request, bot_id: int, chat_id: int):
+    rows = ChatMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id)
+    data = [
+        {
+            "message_id": m.message_id,
+            "sender_name": m.sender_name or (str(m.sender_id) if m.sender_id else "—"),
+            "sender_username": m.sender_username,
+            "text": m.text,
+            "media_type": m.media_type,
+            "outgoing": m.outgoing,
+            "date": timezone.localtime(m.date).strftime("%Y-%m-%d %H:%M")
+            if m.date
+            else "",
+        }
+        for m in rows
+    ]
+    return JsonResponse({"messages": data})

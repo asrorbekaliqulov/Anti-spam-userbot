@@ -1,0 +1,132 @@
+{% extends "agents/base.html" %}
+{% block title %}Chats - AntiSpam Agents{% endblock %}
+{% block heading %}Chats{% endblock %}
+{% block content %}
+
+<div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
+  <form method="get" class="d-flex align-items-center gap-2">
+    <span class="text-secondary small">Account:</span>
+    <select name="bot" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
+      {% for b in bots %}
+      <option value="{{ b.id }}" {% if bot and b.id == bot.id %}selected{% endif %}>
+        {{ b.username|default:b.phone|default:b.id }} ({{ b.status }})
+      </option>
+      {% endfor %}
+    </select>
+    <input type="hidden" name="filter" value="{{ filter }}">
+  </form>
+
+  {% if bot %}
+  <form method="post" action="{% url 'agents:sync_chats' bot.id %}" id="syncForm">
+    {% csrf_token %}
+    <button class="btn btn-sm btn-success" id="syncBtn">
+      <i class="bi bi-arrow-repeat me-1"></i> Sync chat list
+    </button>
+  </form>
+  {% endif %}
+</div>
+
+{% if not bot %}
+  <div class="alert alert-dark border">No userbots yet. <a href="{% url 'agents:qr_add' %}" class="alert-link">Add one via QR</a>.</div>
+{% else %}
+
+<div id="cmdStatus" class="small text-secondary mb-2"></div>
+
+<!-- Filter tabs -->
+<ul class="nav nav-pills mb-3 gap-1">
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'all' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=all">All <span class="badge text-bg-dark border ms-1">{{ counts.all }}</span></a></li>
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'group' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=group">Groups <span class="badge text-bg-dark border ms-1">{{ counts.group }}</span></a></li>
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'admin' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=admin">Admin groups <span class="badge text-bg-dark border ms-1">{{ counts.admin }}</span></a></li>
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'channel' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=channel">Channels <span class="badge text-bg-dark border ms-1">{{ counts.channel }}</span></a></li>
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'private' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=private">Users <span class="badge text-bg-dark border ms-1">{{ counts.private }}</span></a></li>
+  <li class="nav-item"><a class="nav-link py-1 px-3 {% if filter == 'bot' %}active{% endif %}" href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=bot">Bots <span class="badge text-bg-dark border ms-1">{{ counts.bot }}</span></a></li>
+</ul>
+
+<div class="card p-0">
+  <div class="list-group list-group-flush">
+    {% for d in dialogs %}
+    <div class="list-group-item bg-transparent d-flex align-items-center gap-3 py-2">
+      <div class="rounded-circle d-flex align-items-center justify-content-center flex-shrink-0"
+           style="width:42px;height:42px;background:#222b3a;">
+        {% if d.dialog_type == 'channel' %}<i class="bi bi-megaphone text-info"></i>
+        {% elif d.dialog_type == 'bot' %}<i class="bi bi-robot text-warning"></i>
+        {% elif d.dialog_type == 'private' %}<i class="bi bi-person text-light"></i>
+        {% else %}<i class="bi bi-people text-success"></i>{% endif %}
+      </div>
+      <div class="flex-grow-1 min-w-0">
+        <div class="d-flex align-items-center gap-2">
+          <a class="text-light text-decoration-none fw-semibold text-truncate"
+             href="{% url 'agents:chat_messages' bot.id d.chat_id %}">
+            {{ d.title|default:d.username|default:d.chat_id }}
+          </a>
+          {% if d.is_admin %}<span class="badge text-bg-primary badge-stage">admin</span>{% endif %}
+          {% if d.monitored %}<span class="badge text-bg-success badge-stage"><i class="bi bi-shield-check"></i> anti-spam</span>{% endif %}
+        </div>
+        <div class="small text-secondary text-truncate">
+          {% if d.username %}@{{ d.username }} &middot; {% endif %}
+          {{ d.dialog_type }}{% if d.members_count %} &middot; {{ d.members_count }} members{% endif %}
+          {% if d.last_message %} &middot; {{ d.last_message }}{% endif %}
+        </div>
+      </div>
+      <div class="text-nowrap d-flex gap-2">
+        <a class="btn btn-sm btn-outline-secondary" href="{% url 'agents:chat_messages' bot.id d.chat_id %}">
+          <i class="bi bi-chat-text"></i> Read
+        </a>
+        {% if d.is_group %}
+        <form method="post" action="{% url 'agents:toggle_antispam' d.id %}?filter={{ filter }}">
+          {% csrf_token %}
+          <button class="btn btn-sm {% if d.monitored %}btn-success{% else %}btn-outline-success{% endif %}">
+            <i class="bi bi-{% if d.monitored %}toggle-on{% else %}toggle-off{% endif %}"></i>
+            anti-spam {% if d.monitored %}ON{% else %}OFF{% endif %}
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% empty %}
+    <div class="list-group-item bg-transparent text-center text-secondary py-5">
+      No chats cached yet for this filter.<br>
+      Click <b>Sync chat list</b> (the engine must be running).
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if bot %}
+<script>
+const botId = {{ bot.id }};
+let syncing = false;
+
+document.getElementById('syncForm')?.addEventListener('submit', () => {
+  const btn = document.getElementById('syncBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> queued...';
+});
+
+async function pollCmd(){
+  try {
+    const res = await fetch("{% url 'agents:api_command_status' %}?bot=" + botId);
+    const s = await res.json();
+    const el = document.getElementById('cmdStatus');
+    if(s.status === 'pending' || s.status === 'running'){
+      syncing = true;
+      el.innerHTML = '<i class="bi bi-hourglass-split text-warning"></i> ' + (s.kind||'') + ': ' + s.status + '...';
+    } else if(syncing && s.status === 'done'){
+      el.innerHTML = '<i class="bi bi-check-circle text-success"></i> ' + (s.result||'done') + ' - reloading...';
+      setTimeout(() => location.reload(), 800);
+      syncing = false;
+    } else if(s.status === 'failed'){
+      el.innerHTML = '<i class="bi bi-x-circle text-danger"></i> ' + (s.result||'failed');
+    } else {
+      el.innerHTML = '';
+    }
+  } catch(e){ /* ignore */ }
+}
+pollCmd();
+setInterval(pollCmd, 2500);
+</script>
+{% endif %}
+{% endblock %}

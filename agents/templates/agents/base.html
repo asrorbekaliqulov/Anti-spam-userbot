@@ -32,6 +32,7 @@
       <ul class="nav flex-column">
         <li class="nav-item"><a class="nav-link {% if active == 'dashboard' %}active{% endif %}" href="{% url 'agents:dashboard' %}"><i class="bi bi-speedometer2 me-2"></i>Dashboard</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'userbots' %}active{% endif %}" href="{% url 'agents:userbots' %}"><i class="bi bi-robot me-2"></i>Agents (Userbots)</a></li>
+        <li class="nav-item"><a class="nav-link {% if active == 'chats' %}active{% endif %}" href="{% url 'agents:chats' %}"><i class="bi bi-chat-dots me-2"></i>Chats</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'logs' %}active{% endif %}" href="{% url 'agents:logs' %}"><i class="bi bi-card-list me-2"></i>Security Logs</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'filters' %}active{% endif %}" href="{% url 'agents:filters' %}"><i class="bi bi-funnel me-2"></i>Filter Rules</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'propagation' %}active{% endif %}" href="{% url 'agents:propagation' %}"><i class="bi bi-diagram-3 me-2"></i>Propagation</a></li>

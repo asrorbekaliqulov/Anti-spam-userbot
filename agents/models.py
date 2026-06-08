@@ -235,3 +235,117 @@ class SecurityLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.action_taken} {self.spammer_id} @ {self.timestamp:%Y-%m-%d %H:%M}"
+
+
+
+class TelegramDialog(models.Model):
+    """
+    A cached entry from a userbot's chat list (the result of `get_dialogs`).
+
+    This powers the Telegram-like browser in the dashboard. It is a *cache*: the
+    engine refreshes it on demand (via an EngineCommand) because only the engine
+    process owns the live Pyrogram session.
+    """
+
+    class DialogType(models.TextChoices):
+        PRIVATE = "private", "User"
+        BOT = "bot", "Bot"
+        GROUP = "group", "Group"
+        SUPERGROUP = "supergroup", "Supergroup"
+        CHANNEL = "channel", "Channel"
+
+    userbot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="dialogs"
+    )
+    chat_id = models.BigIntegerField()
+    dialog_type = models.CharField(max_length=12, choices=DialogType.choices)
+    title = models.CharField(max_length=255, blank=True, default="")
+    username = models.CharField(max_length=64, blank=True, default="")
+    is_admin = models.BooleanField(default=False)
+    members_count = models.IntegerField(null=True, blank=True)
+    # Mirror of "is this group being anti-spam monitored" for quick display.
+    monitored = models.BooleanField(default=False)
+    last_message = models.CharField(max_length=512, blank=True, default="")
+    last_message_date = models.DateTimeField(null=True, blank=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-last_message_date", "title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["userbot", "chat_id"], name="unique_dialog_per_bot"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.title or self.username or self.chat_id} ({self.dialog_type})"
+
+    @property
+    def is_group(self) -> bool:
+        return self.dialog_type in {self.DialogType.GROUP, self.DialogType.SUPERGROUP}
+
+
+class ChatMessage(models.Model):
+    """A cached message used to read a chat's recent history in the dashboard."""
+
+    userbot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="cached_messages"
+    )
+    chat_id = models.BigIntegerField(db_index=True)
+    message_id = models.BigIntegerField()
+    sender_id = models.BigIntegerField(null=True, blank=True)
+    sender_name = models.CharField(max_length=128, blank=True, default="")
+    sender_username = models.CharField(max_length=64, blank=True, default="")
+    text = models.TextField(blank=True, default="")
+    media_type = models.CharField(max_length=24, blank=True, default="")
+    outgoing = models.BooleanField(default=False)
+    date = models.DateTimeField(null=True, blank=True)
+    fetched_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["date", "message_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["userbot", "chat_id", "message_id"],
+                name="unique_cached_message",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"msg {self.message_id} in {self.chat_id}"
+
+
+class EngineCommand(models.Model):
+    """
+    A read request from the dashboard that the engine executes with its live
+    session (process-safe RPC over the database).
+    """
+
+    class Kind(models.TextChoices):
+        SYNC_DIALOGS = "sync_dialogs", "Sync chat list"
+        FETCH_HISTORY = "fetch_history", "Fetch chat history"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+
+    userbot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="commands"
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    chat_id = models.BigIntegerField(null=True, blank=True)
+    limit = models.IntegerField(default=50)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING
+    )
+    result = models.CharField(max_length=512, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.kind} bot#{self.userbot_id} ({self.status})"

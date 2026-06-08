@@ -15,18 +15,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 from django.conf import settings
+from django.utils import timezone as djtz
 
 from pyrogram import Client, filters as pf
+from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.handlers import MessageHandler
 
 from . import repository as repo
 from .filters import ai_decide, precheck
 from .hashing import image_phash, text_hash
-from .propagation import delete_and_ban, propagate_agent
+from .propagation import delete_and_ban, propagate_agent, safe_call, throttle
 
 logger = logging.getLogger(__name__)
+
+# How long the engine caches each bot's monitored-chat set (seconds). A short
+# TTL lets dashboard anti-spam toggles take effect without restarting the engine.
+_MONITOR_TTL = 12.0
 
 
 class AgentRunner:
@@ -34,6 +41,9 @@ class AgentRunner:
         self.clients: dict[int, Client] = {}
         self._running = False
         self._job_task: asyncio.Task | None = None
+        self._cmd_task: asyncio.Task | None = None
+        # bot_id -> (set_of_chat_ids, loaded_at)
+        self._monitor_cache: dict[int, tuple[set[int], float]] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -42,12 +52,22 @@ class AgentRunner:
             logger.warning("No active userbots found. Add one via the dashboard QR flow.")
         for bot in bots:
             await self._start_one(bot)
-        # Background task that executes propagation jobs queued from the dashboard.
+        # Background tasks: propagation jobs + dashboard read commands.
         self._job_task = asyncio.ensure_future(self._job_loop())
+        self._cmd_task = asyncio.ensure_future(self._command_loop())
         logger.info("Agent runner online with %d userbot(s).", len(self.clients))
 
+    async def _is_monitored(self, bot_id: int, chat_id: int) -> bool:
+        """TTL-cached lookup of whether a chat is anti-spam monitored right now."""
+        cached = self._monitor_cache.get(bot_id)
+        now = time.time()
+        if cached is None or now - cached[1] > _MONITOR_TTL:
+            chat_ids = set(await repo.monitored_chat_ids(bot_id))
+            self._monitor_cache[bot_id] = (chat_ids, now)
+            cached = self._monitor_cache[bot_id]
+        return chat_id in cached[0]
+
     async def _start_one(self, bot: dict) -> None:
-        chat_ids = await repo.monitored_chat_ids(bot["id"])
         client = Client(
             name=f"agent-{bot['id']}",
             api_id=bot["api_id"] or settings.TELEGRAM_API_ID,
@@ -56,9 +76,12 @@ class AgentRunner:
             workdir=str(settings.PYROGRAM_WORKDIR),
         )
 
-        async def handler(client: Client, message, _bot_id=bot["id"], _chats=set(chat_ids)):
+        async def handler(client: Client, message, _bot_id=bot["id"]):
             try:
-                if _chats and message.chat and message.chat.id not in _chats:
+                if not message.chat:
+                    return
+                # Dynamic check so toggling anti-spam in the dashboard is live.
+                if not await self._is_monitored(_bot_id, message.chat.id):
                     return
                 await self._on_message(client, message, _bot_id)
             except Exception as exc:  # noqa: BLE001 - never kill the listener
@@ -244,8 +267,143 @@ class AgentRunner:
         self._running = False
         if self._job_task:
             self._job_task.cancel()
+        if self._cmd_task:
+            self._cmd_task.cancel()
         for client in self.clients.values():
             try:
                 await client.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ----------------------------------------------------------------------- #
+    #  Dashboard read commands (sync chat list / fetch history)
+    # ----------------------------------------------------------------------- #
+    async def _command_loop(self) -> None:
+        while self._running:
+            try:
+                cmds = await repo.claim_pending_commands()
+                for cmd in cmds:
+                    await self._run_command(cmd)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("command loop error: %s", exc)
+            await asyncio.sleep(4)
+
+    async def _run_command(self, cmd: dict) -> None:
+        client = self.clients.get(cmd["userbot_id"])
+        if client is None:
+            await repo.finish_command(
+                cmd["id"], "failed", "Userbot is not running in the engine."
+            )
+            return
+        try:
+            if cmd["kind"] == "sync_dialogs":
+                count = await self._sync_dialogs(client, cmd["userbot_id"])
+                await repo.finish_command(cmd["id"], "done", f"Synced {count} chats.")
+            elif cmd["kind"] == "fetch_history":
+                count = await self._fetch_history(
+                    client, cmd["userbot_id"], cmd["chat_id"], cmd["limit"]
+                )
+                await repo.finish_command(cmd["id"], "done", f"Fetched {count} messages.")
+            else:
+                await repo.finish_command(cmd["id"], "failed", "Unknown command.")
+        except Exception as exc:  # noqa: BLE001
+            await repo.finish_command(cmd["id"], "failed", str(exc))
+            logger.exception("command #%s failed: %s", cmd["id"], exc)
+
+    @staticmethod
+    def _classify_chat(chat) -> str:
+        t = chat.type
+        if t == ChatType.PRIVATE:
+            return "bot" if getattr(chat, "is_bot", False) else "private"
+        if t == ChatType.BOT:
+            return "bot"
+        if t == ChatType.GROUP:
+            return "group"
+        if t == ChatType.SUPERGROUP:
+            return "supergroup"
+        if t == ChatType.CHANNEL:
+            return "channel"
+        return "group"
+
+    async def _sync_dialogs(self, client: Client, bot_id: int, cap: int = 300) -> int:
+        seen: list[int] = []
+        count = 0
+        async for dialog in client.get_dialogs():
+            chat = dialog.chat
+            dtype = self._classify_chat(chat)
+
+            is_admin = False
+            if dtype in {"group", "supergroup", "channel"}:
+                is_admin = await self._is_self_admin(client, chat.id)
+
+            title = chat.title or " ".join(
+                p for p in [getattr(chat, "first_name", ""), getattr(chat, "last_name", "")] if p
+            )
+            top = dialog.top_message
+            preview = ""
+            last_date = None
+            if top:
+                preview = (top.text or top.caption or "")[:120]
+                last_date = djtz.make_aware(top.date) if top.date and djtz.is_naive(top.date) else top.date
+
+            await repo.upsert_dialog(
+                bot_id,
+                {
+                    "chat_id": chat.id,
+                    "dialog_type": dtype,
+                    "title": title or "",
+                    "username": chat.username or "",
+                    "is_admin": is_admin,
+                    "members_count": getattr(chat, "members_count", None),
+                    "last_message": preview,
+                    "last_message_date": last_date,
+                },
+            )
+            seen.append(chat.id)
+            count += 1
+            if count >= cap:
+                break
+        await repo.prune_dialogs(bot_id, seen)
+        return count
+
+    async def _is_self_admin(self, client: Client, chat_id: int) -> bool:
+        try:
+            member = await safe_call(
+                lambda: client.get_chat_member(chat_id, "me"),
+                what="get_chat_member",
+            )
+            return member.status in {
+                ChatMemberStatus.OWNER,
+                ChatMemberStatus.ADMINISTRATOR,
+            }
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _fetch_history(
+        self, client: Client, bot_id: int, chat_id: int, limit: int
+    ) -> int:
+        limit = max(1, min(limit or 50, 200))
+        messages: list[dict] = []
+        async for m in client.get_chat_history(chat_id, limit=limit):
+            sender = m.from_user
+            name = ""
+            if sender:
+                name = " ".join(
+                    p for p in [sender.first_name or "", sender.last_name or ""] if p
+                ) or (sender.username or str(sender.id))
+            date = m.date
+            if date and djtz.is_naive(date):
+                date = djtz.make_aware(date)
+            messages.append(
+                {
+                    "message_id": m.id,
+                    "sender_id": sender.id if sender else None,
+                    "sender_name": name,
+                    "sender_username": (sender.username if sender else "") or "",
+                    "text": m.text or m.caption or "",
+                    "media_type": (m.media.value if m.media else ""),
+                    "outgoing": bool(m.outgoing),
+                    "date": date,
+                }
+            )
+        return await repo.replace_chat_messages(bot_id, chat_id, messages)
