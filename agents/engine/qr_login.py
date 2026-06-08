@@ -241,6 +241,15 @@ class QRLoginManager:
     async def _finalise(self, client: Client, state: QRState) -> None:
         """A scan succeeded: persist the session string as an active UserBot."""
         me = await client.get_me()
+
+        # The raw QR flow bypasses Pyrogram's normal authorize(), so the storage
+        # metadata that export_session_string() serialises (api_id / user_id /
+        # is_bot) is still unset. Leaving them as None makes struct.pack raise
+        # "required argument is not an integer", so populate them explicitly.
+        await client.storage.api_id(client.api_id)
+        await client.storage.user_id(me.id)
+        await client.storage.is_bot(False)
+
         session_string = await client.export_session_string()
 
         from agents.models import UserBot
