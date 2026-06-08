@@ -12,6 +12,7 @@ All clients share the one background event loop and run concurrently.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -23,7 +24,7 @@ from pyrogram.handlers import MessageHandler
 from . import repository as repo
 from .filters import ai_decide, precheck
 from .hashing import image_phash, text_hash
-from .propagation import delete_and_ban
+from .propagation import delete_and_ban, propagate_agent
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,18 @@ logger = logging.getLogger(__name__)
 class AgentRunner:
     def __init__(self) -> None:
         self.clients: dict[int, Client] = {}
+        self._running = False
+        self._job_task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        self._running = True
         bots = await repo.list_active_userbots()
         if not bots:
             logger.warning("No active userbots found. Add one via the dashboard QR flow.")
         for bot in bots:
             await self._start_one(bot)
+        # Background task that executes propagation jobs queued from the dashboard.
+        self._job_task = asyncio.ensure_future(self._job_loop())
         logger.info("Agent runner online with %d userbot(s).", len(self.clients))
 
     async def _start_one(self, bot: dict) -> None:
@@ -191,7 +197,53 @@ class AgentRunner:
             except OSError:
                 pass
 
+    async def _job_loop(self) -> None:
+        """Poll for dashboard-created propagation jobs and execute them."""
+        while self._running:
+            try:
+                jobs = await repo.claim_pending_jobs()
+                for job in jobs:
+                    await self._run_job(job)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("job loop error: %s", exc)
+            await asyncio.sleep(5)
+
+    async def _run_job(self, job: dict) -> None:
+        admin_client = self.clients.get(job["admin_bot_id"])
+        if admin_client is None:
+            await repo.finish_job(
+                job["id"],
+                "failed",
+                "Admin userbot is not running in the engine. Start it (it must be "
+                "active) and retry.",
+            )
+            return
+        if not job["new_bot_telegram_id"]:
+            await repo.finish_job(
+                job["id"], "failed", "Target userbot has no telegram_id stored."
+            )
+            return
+        try:
+            await propagate_agent(
+                admin_client,
+                job["chat_id"],
+                job["new_bot_telegram_id"],
+                title=job["admin_title"],
+            )
+            # Record that the new bot now monitors this chat.
+            await repo.upsert_group(job["new_bot_id"], job["chat_id"], "", "")
+            await repo.finish_job(
+                job["id"], "done", "Invited and promoted to moderation admin."
+            )
+            logger.info("Propagation job #%s done.", job["id"])
+        except Exception as exc:  # noqa: BLE001
+            await repo.finish_job(job["id"], "failed", str(exc))
+            logger.exception("Propagation job #%s failed: %s", job["id"], exc)
+
     async def stop(self) -> None:
+        self._running = False
+        if self._job_task:
+            self._job_task.cancel()
         for client in self.clients.values():
             try:
                 await client.stop()

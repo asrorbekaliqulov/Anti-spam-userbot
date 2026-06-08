@@ -128,6 +128,77 @@ class SpamContent(models.Model):
         return f"{self.content_type}:{self.content_hash[:12]}"
 
 
+class FilterRule(models.Model):
+    """
+    A dashboard-managed stage-2 detection rule.
+
+    Keywords (substring match), single emojis, or full regex patterns can be
+    added/removed/toggled from the UI. The engine reloads active rules on a short
+    TTL so changes take effect within seconds across processes.
+    """
+
+    class RuleType(models.TextChoices):
+        KEYWORD = "keyword", "Keyword (substring)"
+        EMOJI = "emoji", "Emoji"
+        REGEX = "regex", "Regex pattern"
+
+    rule_type = models.CharField(max_length=16, choices=RuleType.choices)
+    pattern = models.CharField(max_length=255)
+    note = models.CharField(max_length=255, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    hits = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["rule_type", "pattern"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule_type", "pattern"], name="unique_filter_rule"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.rule_type}] {self.pattern}"
+
+
+class PropagationJob(models.Model):
+    """
+    A request (created from the dashboard) for an admin userbot to invite and
+    promote another userbot inside a group.
+
+    The engine process picks up `pending` jobs and runs them with its already
+    connected admin session - this avoids using the same session string from two
+    processes at once (which Telegram can treat as a hijack and revoke).
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+
+    admin_bot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="propagation_jobs_as_admin"
+    )
+    new_bot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="propagation_jobs_as_target"
+    )
+    chat_id = models.BigIntegerField()
+    admin_title = models.CharField(max_length=64, blank=True, default="Anti-Spam Agent")
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING
+    )
+    result = models.CharField(max_length=512, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"propagate bot#{self.new_bot_id} -> chat {self.chat_id} ({self.status})"
+
+
 class SecurityLog(models.Model):
     """Audit trail of every protective action taken by an agent."""
 

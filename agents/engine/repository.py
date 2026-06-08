@@ -114,3 +114,48 @@ def cache_spam_content(*, content_type: str, content_hash: str, raw_data: str = 
         content_hash=content_hash,
         defaults={"raw_data": raw_data[:2000]},
     )
+
+
+
+@sync_to_async
+def claim_pending_jobs() -> list[dict]:
+    """
+    Atomically move PENDING propagation jobs to RUNNING and return their data.
+
+    Returning a plain list of dicts keeps the async caller away from lazy ORM
+    attribute access.
+    """
+    from agents.models import PropagationJob
+
+    jobs: list[dict] = []
+    pending_ids = list(
+        PropagationJob.objects.filter(
+            status=PropagationJob.Status.PENDING
+        ).values_list("id", flat=True)
+    )
+    for job_id in pending_ids:
+        # Claim one-by-one so two engine instances never grab the same job.
+        claimed = PropagationJob.objects.filter(
+            id=job_id, status=PropagationJob.Status.PENDING
+        ).update(status=PropagationJob.Status.RUNNING)
+        if not claimed:
+            continue
+        job = PropagationJob.objects.select_related("admin_bot", "new_bot").get(id=job_id)
+        jobs.append(
+            {
+                "id": job.id,
+                "admin_bot_id": job.admin_bot_id,
+                "new_bot_id": job.new_bot_id,
+                "new_bot_telegram_id": job.new_bot.telegram_id,
+                "chat_id": job.chat_id,
+                "admin_title": job.admin_title or "Anti-Spam Agent",
+            }
+        )
+    return jobs
+
+
+@sync_to_async
+def finish_job(job_id: int, status: str, result: str) -> None:
+    from agents.models import PropagationJob
+
+    PropagationJob.objects.filter(id=job_id).update(status=status, result=result[:500])

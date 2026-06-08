@@ -21,6 +21,19 @@
       <button id="startBtn" class="btn btn-success mt-3 d-none">
         <i class="bi bi-arrow-clockwise me-1"></i> Restart QR
       </button>
+
+      <!-- 2FA cloud password step -->
+      <div id="passwordBox" class="mt-3 text-start d-none">
+        <hr class="border-secondary">
+        <label class="form-label small text-warning">
+          <i class="bi bi-shield-lock"></i> This account has 2FA enabled. Enter its cloud password:
+        </label>
+        <div class="input-group">
+          <input type="password" id="passwordInput" class="form-control" placeholder="cloud password" autocomplete="off">
+          <button id="passwordBtn" class="btn btn-warning"><i class="bi bi-unlock"></i> Submit</button>
+        </div>
+        <div id="passwordError" class="text-danger small mt-1"></div>
+      </div>
     </div>
   </div>
 
@@ -100,11 +113,19 @@ async function pollQR(){
     expiresAt = s.expires_at; startCountdown();
   }
 
-  if(s.status === 'waiting'){ setStatus('waiting for scan', 'info'); }
+  if(s.status === 'waiting'){ setStatus('waiting for scan', 'info'); hidePassword(); }
   else if(s.status === 'pending'){ setStatus('initializing', 'secondary'); }
+  else if(s.status === 'password'){
+    setStatus('2FA password required', 'warning');
+    clearInterval(countdownTimer);
+    document.getElementById('countdown').textContent = '';
+    document.getElementById('passwordBox').classList.remove('d-none');
+    document.getElementById('passwordError').textContent = s.password_error || '';
+  }
   else if(s.status === 'success'){
     setStatus('linked!', 'success');
     clearInterval(poller); clearInterval(countdownTimer);
+    hidePassword();
     document.getElementById('countdown').textContent = '';
     document.getElementById('successName').textContent = s.username || ('#' + s.userbot_id);
     document.getElementById('successBox').classList.remove('d-none');
@@ -113,6 +134,7 @@ async function pollQR(){
   else if(s.status === 'expired' || s.status === 'error'){
     setStatus(s.status, 'danger');
     clearInterval(poller); clearInterval(countdownTimer);
+    hidePassword();
     const box = document.getElementById('errorBox');
     box.textContent = s.error || 'QR expired. Please restart.';
     box.classList.remove('d-none');
@@ -120,6 +142,31 @@ async function pollQR(){
   }
 }
 
+function hidePassword(){
+  document.getElementById('passwordBox').classList.add('d-none');
+}
+
+async function submitPassword(){
+  const pwd = document.getElementById('passwordInput').value;
+  if(!pwd) return;
+  const btn = document.getElementById('passwordBtn');
+  btn.disabled = true;
+  const body = new URLSearchParams({sid: sessionId, password: pwd});
+  await fetch("{% url 'agents:api_qr_password' %}", {
+    method: 'POST',
+    headers: {'X-CSRFToken': csrftoken, 'Content-Type': 'application/x-www-form-urlencoded'},
+    body
+  });
+  document.getElementById('passwordInput').value = '';
+  document.getElementById('passwordError').textContent = '';
+  setStatus('verifying password...', 'info');
+  btn.disabled = false;
+}
+
+document.getElementById('passwordBtn').addEventListener('click', submitPassword);
+document.getElementById('passwordInput').addEventListener('keydown', (e) => {
+  if(e.key === 'Enter'){ e.preventDefault(); submitPassword(); }
+});
 document.getElementById('startBtn').addEventListener('click', startQR);
 startQR();
 </script>

@@ -32,6 +32,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 
 from pyrogram import Client
+from pyrogram.errors import PasswordHashInvalid, SessionPasswordNeeded
 from pyrogram.raw.functions.auth import ExportLoginToken, ImportLoginToken
 from pyrogram.raw.types.auth import (
     LoginToken,
@@ -58,6 +59,10 @@ class QRState:
     error: str = ""
     userbot_id: int | None = None
     username: str = ""
+    # --- 2FA (cloud password) support ---
+    password: str = ""
+    password_error: str = ""
+    password_event: object = None  # asyncio.Event, created on the engine loop
     created_at: float = field(default_factory=time.time)
 
 
@@ -108,6 +113,17 @@ class QRLoginManager:
     def get(self, session_id: str) -> QRState | None:
         return self._states.get(session_id)
 
+    def submit_password(self, session_id: str, password: str) -> bool:
+        """Called by the dashboard when the operator submits the 2FA password."""
+        state = self._states.get(session_id)
+        if not state or state.password_event is None:
+            return False
+        state.password = password
+        state.password_error = ""
+        # The event lives on the background loop; signal it thread-safely.
+        self._loop.loop.call_soon_threadsafe(state.password_event.set)
+        return True
+
     def cleanup(self, max_age: float = 600) -> None:
         now = time.time()
         for sid in list(self._states):
@@ -129,6 +145,8 @@ class QRLoginManager:
             api_hash=api_hash,
             in_memory=True,
         )
+        # The Event must be created on the loop that will await it (this loop).
+        state.password_event = asyncio.Event()
 
         try:
             await client.connect()  # connect WITHOUT authorising
@@ -146,9 +164,15 @@ class QRLoginManager:
     async def _login_loop(self, client: Client, state: QRState, api_id, api_hash) -> None:
         deadline = time.time() + 300  # give the operator 5 minutes to scan
         while time.time() < deadline:
-            r = await client.invoke(
-                ExportLoginToken(api_id=api_id, api_hash=api_hash, except_ids=[])
-            )
+            try:
+                r = await client.invoke(
+                    ExportLoginToken(api_id=api_id, api_hash=api_hash, except_ids=[])
+                )
+            except SessionPasswordNeeded:
+                # The account has 2FA (cloud password) enabled. The QR scan was
+                # accepted but Telegram now needs the password to finish.
+                await self._handle_2fa(client, state)
+                return
 
             if isinstance(r, LoginToken):
                 # Still waiting for a scan -> (re)publish the QR for the browser.
@@ -161,7 +185,11 @@ class QRLoginManager:
                 continue
 
             if isinstance(r, LoginTokenMigrateTo):
-                r = await self._migrate(client, r.dc_id, r.token)
+                try:
+                    r = await self._migrate(client, r.dc_id, r.token)
+                except SessionPasswordNeeded:
+                    await self._handle_2fa(client, state)
+                    return
 
             if isinstance(r, LoginTokenSuccess):
                 await self._finalise(client, state)
@@ -169,6 +197,30 @@ class QRLoginManager:
 
         state.status = "expired"
         state.error = "QR code expired before it was scanned."
+
+    async def _handle_2fa(self, client: Client, state: QRState) -> None:
+        """Prompt the dashboard for the cloud password and complete sign-in."""
+        while True:
+            state.status = "password"
+            try:
+                await asyncio.wait_for(state.password_event.wait(), timeout=180)
+            except asyncio.TimeoutError:
+                state.status = "expired"
+                state.error = "2FA password was not provided in time."
+                return
+            state.password_event.clear()
+
+            try:
+                await client.check_password(state.password)
+            except PasswordHashInvalid:
+                # Let the operator try again with a different password.
+                state.password_error = "Incorrect password. Please try again."
+                continue
+            finally:
+                state.password = ""  # never keep the plaintext password around
+
+            await self._finalise(client, state)
+            return
 
     async def _migrate(self, client: Client, dc_id: int, token: bytes):
         """Handle `LoginTokenMigrateTo` by moving the session to the target DC."""

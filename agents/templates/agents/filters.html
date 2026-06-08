@@ -1,0 +1,60 @@
+{% extends "agents/base.html" %}
+{% block title %}Filter Rules - AntiSpam Agents{% endblock %}
+{% block heading %}Filter Rules (stage 2: regex &amp; emoji){% endblock %}
+{% block content %}
+
+<div class="card p-3 mb-4">
+  <h6 class="text-secondary mb-3"><i class="bi bi-plus-circle me-1"></i>Add a detection rule</h6>
+  <form method="post" action="{% url 'agents:add_rule' %}" class="row g-2 align-items-end">
+    {% csrf_token %}
+    <div class="col-md-3">
+      <label class="form-label small text-secondary">Type</label>
+      <select name="rule_type" class="form-select" id="ruleType">
+        {% for val, label in rule_types %}
+        <option value="{{ val }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small text-secondary">Pattern</label>
+      <input type="text" name="pattern" class="form-control" id="patternInput"
+             placeholder="e.g. profilimda  /  🔞  /  t\.me/\w+" required>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small text-secondary">Note (optional)</label>
+      <input type="text" name="note" class="form-control" placeholder="why this rule">
+    </div>
+    <div class="col-md-2 d-grid">
+      <button class="btn btn-success"><i class="bi bi-plus-lg"></i> Add</button>
+    </div>
+  </form>
+  <div class="form-text mt-2" id="ruleHint">Keyword = case-insensitive substring match.</div>
+</div>
+
+<div class="row g-3">
+  {% include "agents/_rule_table.html" with title="Keywords" icon="bi-chat-left-text" rules=keywords %}
+  {% include "agents/_rule_table.html" with title="Emojis" icon="bi-emoji-sunglasses" rules=emojis %}
+  {% include "agents/_rule_table.html" with title="Regex patterns" icon="bi-regex" rules=regexes %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const hints = {
+  keyword: "Keyword = case-insensitive substring match (e.g. 'profilimda').",
+  emoji: "Emoji = exact emoji to look for (e.g. 🔞).",
+  regex: "Regex = Python regular expression (e.g. t\\.me/\\w+). Validated on save."
+};
+const ph = {
+  keyword: "e.g. profilimda",
+  emoji: "e.g. 🔞",
+  regex: "e.g. t\\.me/\\w+"
+};
+const sel = document.getElementById('ruleType');
+sel.addEventListener('change', () => {
+  document.getElementById('ruleHint').textContent = hints[sel.value];
+  document.getElementById('patternInput').placeholder = ph[sel.value];
+});
+</script>
+{% endblock %}

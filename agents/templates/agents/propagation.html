@@ -1,0 +1,99 @@
+{% extends "agents/base.html" %}
+{% block title %}Propagation - AntiSpam Agents{% endblock %}
+{% block heading %}Group Propagation (invite + auto-admin){% endblock %}
+{% block content %}
+
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card p-3">
+      <h6 class="text-secondary mb-3"><i class="bi bi-diagram-3 me-1"></i>New propagation job</h6>
+      <form method="post" action="{% url 'agents:create_propagation' %}">
+        {% csrf_token %}
+        <div class="mb-3">
+          <label class="form-label small text-secondary">Admin userbot (already admin in the group)</label>
+          <select name="admin_bot" class="form-select" required>
+            {% for b in active_bots %}
+            <option value="{{ b.id }}">{{ b.username|default:b.phone|default:b.id }} (#{{ b.id }})</option>
+            {% empty %}
+            <option disabled>No active userbots</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label small text-secondary">New userbot (to be invited &amp; promoted)</label>
+          <select name="new_bot" class="form-select" required>
+            {% for b in all_bots %}
+            <option value="{{ b.id }}">{{ b.username|default:b.phone|default:b.id }} (#{{ b.id }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label small text-secondary">Target chat id</label>
+          <input type="number" name="chat_id" class="form-control" placeholder="-1001234567890" required>
+        </div>
+        <div class="mb-3">
+          <label class="form-label small text-secondary">Admin title (optional)</label>
+          <input type="text" name="admin_title" class="form-control" value="Anti-Spam Agent">
+        </div>
+        <button class="btn btn-success w-100"><i class="bi bi-send me-1"></i> Queue job</button>
+      </form>
+      <div class="alert alert-dark border small mt-3 mb-0">
+        <i class="bi bi-info-circle text-info"></i>
+        Jobs are executed by the engine process (<code>run_agents</code>), which uses
+        the admin bot's live session. The admin bot must be <b>active</b> and running.
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-7">
+    <div class="card p-3">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h6 class="text-secondary mb-0"><i class="bi bi-list-task me-1"></i>Recent jobs</h6>
+        <span class="text-secondary small"><i class="bi bi-broadcast text-success"></i> auto-refresh</span>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle text-light">
+          <thead class="text-secondary">
+            <tr><th>#</th><th>Admin</th><th>New</th><th>Chat</th><th>Status</th><th>Result</th></tr>
+          </thead>
+          <tbody id="jobsBody">
+            <tr><td colspan="6" class="text-center text-secondary py-3">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function jobBadge(s){
+  const map = {pending:'secondary', running:'info', done:'success', failed:'danger'};
+  return `<span class="badge text-bg-${map[s]||'secondary'}">${s}</span>`;
+}
+async function loadJobs(){
+  try {
+    const res = await fetch("{% url 'agents:api_jobs' %}");
+    const data = await res.json();
+    const body = document.getElementById('jobsBody');
+    if(!data.jobs.length){
+      body.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-3">No jobs yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = data.jobs.map(j => `
+      <tr>
+        <td>${j.id}</td>
+        <td><i class="bi bi-robot"></i> ${j.admin}</td>
+        <td><i class="bi bi-robot"></i> ${j.new}</td>
+        <td class="small text-secondary">${j.chat_id}</td>
+        <td>${jobBadge(j.status)}</td>
+        <td class="small text-secondary">${j.result || ''}</td>
+      </tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+loadJobs();
+setInterval(loadJobs, 3000);
+</script>
+{% endblock %}
