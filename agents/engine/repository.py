@@ -159,3 +159,108 @@ def finish_job(job_id: int, status: str, result: str) -> None:
     from agents.models import PropagationJob
 
     PropagationJob.objects.filter(id=job_id).update(status=status, result=result[:500])
+
+
+
+# --------------------------------------------------------------------------- #
+#  Engine command queue (dashboard -> engine RPC)
+# --------------------------------------------------------------------------- #
+@sync_to_async
+def claim_pending_commands() -> list[dict]:
+    """Atomically claim PENDING EngineCommands (move to RUNNING) and return them."""
+    from agents.models import EngineCommand
+
+    cmds: list[dict] = []
+    pending_ids = list(
+        EngineCommand.objects.filter(
+            status=EngineCommand.Status.PENDING
+        ).values_list("id", flat=True)
+    )
+    for cmd_id in pending_ids:
+        claimed = EngineCommand.objects.filter(
+            id=cmd_id, status=EngineCommand.Status.PENDING
+        ).update(status=EngineCommand.Status.RUNNING)
+        if not claimed:
+            continue
+        cmd = EngineCommand.objects.get(id=cmd_id)
+        cmds.append(
+            {
+                "id": cmd.id,
+                "userbot_id": cmd.userbot_id,
+                "kind": cmd.kind,
+                "chat_id": cmd.chat_id,
+                "limit": cmd.limit,
+            }
+        )
+    return cmds
+
+
+@sync_to_async
+def finish_command(cmd_id: int, status: str, result: str) -> None:
+    from agents.models import EngineCommand
+
+    EngineCommand.objects.filter(id=cmd_id).update(status=status, result=result[:500])
+
+
+# --------------------------------------------------------------------------- #
+#  Dialog (chat list) cache
+# --------------------------------------------------------------------------- #
+@sync_to_async
+def upsert_dialog(userbot_id: int, data: dict) -> None:
+    from agents.models import TelegramDialog, TelegramGroup
+
+    # Keep the "monitored" mirror in sync with the actual TelegramGroup state.
+    monitored = TelegramGroup.objects.filter(
+        monitored_by_id=userbot_id, chat_id=data["chat_id"], is_active=True
+    ).exists()
+    TelegramDialog.objects.update_or_create(
+        userbot_id=userbot_id,
+        chat_id=data["chat_id"],
+        defaults={
+            "dialog_type": data["dialog_type"],
+            "title": data.get("title", "")[:255],
+            "username": data.get("username", "")[:64],
+            "is_admin": data.get("is_admin", False),
+            "members_count": data.get("members_count"),
+            "last_message": data.get("last_message", "")[:512],
+            "last_message_date": data.get("last_message_date"),
+            "monitored": monitored,
+        },
+    )
+
+
+@sync_to_async
+def prune_dialogs(userbot_id: int, keep_chat_ids: list[int]) -> None:
+    """Drop cached dialogs that no longer appear in the latest sync."""
+    from agents.models import TelegramDialog
+
+    TelegramDialog.objects.filter(userbot_id=userbot_id).exclude(
+        chat_id__in=keep_chat_ids
+    ).delete()
+
+
+# --------------------------------------------------------------------------- #
+#  Message cache
+# --------------------------------------------------------------------------- #
+@sync_to_async
+def replace_chat_messages(userbot_id: int, chat_id: int, messages: list[dict]) -> int:
+    from agents.models import ChatMessage
+
+    ChatMessage.objects.filter(userbot_id=userbot_id, chat_id=chat_id).delete()
+    objs = [
+        ChatMessage(
+            userbot_id=userbot_id,
+            chat_id=chat_id,
+            message_id=m["message_id"],
+            sender_id=m.get("sender_id"),
+            sender_name=m.get("sender_name", "")[:128],
+            sender_username=m.get("sender_username", "")[:64],
+            text=m.get("text", ""),
+            media_type=m.get("media_type", "")[:24],
+            outgoing=m.get("outgoing", False),
+            date=m.get("date"),
+        )
+        for m in messages
+    ]
+    ChatMessage.objects.bulk_create(objs, ignore_conflicts=True)
+    return len(objs)

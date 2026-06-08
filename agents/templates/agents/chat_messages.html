@@ -1,0 +1,101 @@
+{% extends "agents/base.html" %}
+{% block title %}{{ dialog.title|default:chat_id }} - Messages{% endblock %}
+{% block heading %}
+  <a href="{% url 'agents:chats' %}?bot={{ bot.id }}" class="text-secondary text-decoration-none"><i class="bi bi-arrow-left"></i></a>
+  {{ dialog.title|default:chat_id }}
+{% endblock %}
+{% block content %}
+
+<div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+  <div class="text-secondary small">
+    {% if dialog %}
+      {% if dialog.username %}@{{ dialog.username }} &middot; {% endif %}
+      {{ dialog.dialog_type }}{% if dialog.members_count %} &middot; {{ dialog.members_count }} members{% endif %}
+      {% if dialog.is_admin %}<span class="badge text-bg-primary ms-1">admin</span>{% endif %}
+      {% if dialog.monitored %}<span class="badge text-bg-success ms-1"><i class="bi bi-shield-check"></i> anti-spam</span>{% endif %}
+    {% else %}chat {{ chat_id }} (not in cached list){% endif %}
+  </div>
+  <form method="post" action="{% url 'agents:fetch_history' bot.id chat_id %}" class="d-flex gap-2" id="fetchForm">
+    {% csrf_token %}
+    <select name="limit" class="form-select form-select-sm" style="width:auto">
+      <option value="30">last 30</option>
+      <option value="50" selected>last 50</option>
+      <option value="100">last 100</option>
+      <option value="200">last 200</option>
+    </select>
+    <button class="btn btn-sm btn-success" id="fetchBtn"><i class="bi bi-download me-1"></i> Fetch messages</button>
+  </form>
+</div>
+
+<div id="cmdStatus" class="small text-secondary mb-2"></div>
+
+<div class="card p-3">
+  <div id="messages" style="max-height:65vh;overflow:auto;">
+    <div class="text-center text-secondary py-4">Loading cached messages...</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const botId = {{ bot.id }};
+const chatId = {{ chat_id }};
+let fetching = false;
+
+document.getElementById('fetchForm').addEventListener('submit', () => {
+  const btn = document.getElementById('fetchBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> queued...';
+});
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+async function loadMessages(){
+  const res = await fetch(`/api/messages/${botId}/${chatId}/`);
+  const data = await res.json();
+  const box = document.getElementById('messages');
+  if(!data.messages.length){
+    box.innerHTML = '<div class="text-center text-secondary py-4">No messages cached. Click <b>Fetch messages</b> (engine must be running).</div>';
+    return;
+  }
+  box.innerHTML = data.messages.map(m => {
+    const side = m.outgoing ? 'text-end' : '';
+    const bubble = m.outgoing ? 'bg-success-subtle text-dark' : 'bg-dark-subtle text-light';
+    const media = m.media_type ? `<span class="badge text-bg-secondary ms-1">${m.media_type}</span>` : '';
+    const uname = m.sender_username ? ` @${esc(m.sender_username)}` : '';
+    return `
+      <div class="mb-2 ${side}">
+        <div class="d-inline-block p-2 rounded-3 ${bubble}" style="max-width:80%;text-align:left;">
+          <div class="small fw-semibold text-primary">${esc(m.sender_name)}${uname}</div>
+          <div>${esc(m.text) || '<span class="text-muted">[no text]</span>'} ${media}</div>
+          <div class="small text-muted mt-1">${m.date}</div>
+        </div>
+      </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+async function pollCmd(){
+  try {
+    const res = await fetch("{% url 'agents:api_command_status' %}?bot=" + botId);
+    const s = await res.json();
+    const el = document.getElementById('cmdStatus');
+    if(s.status === 'pending' || s.status === 'running'){
+      fetching = true;
+      el.innerHTML = '<i class="bi bi-hourglass-split text-warning"></i> ' + (s.kind||'') + ': ' + s.status + '...';
+    } else if(fetching && s.status === 'done'){
+      el.innerHTML = '<i class="bi bi-check-circle text-success"></i> ' + (s.result||'done');
+      fetching = false;
+      loadMessages();
+    } else if(s.status === 'failed'){
+      el.innerHTML = '<i class="bi bi-x-circle text-danger"></i> ' + (s.result||'failed');
+      fetching = false;
+    } else { el.innerHTML = ''; }
+  } catch(e){ /* ignore */ }
+}
+
+loadMessages();
+pollCmd();
+setInterval(pollCmd, 2500);
+</script>
+{% endblock %}

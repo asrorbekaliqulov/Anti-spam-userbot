@@ -2,10 +2,13 @@ from django.contrib import admin
 
 from .models import (
     BlacklistUser,
+    ChatMessage,
+    EngineCommand,
     FilterRule,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    TelegramDialog,
     TelegramGroup,
     UserBot,
 )
@@ -70,3 +73,30 @@ class PropagationJobAdmin(admin.ModelAdmin):
         "id", "admin_bot", "new_bot", "chat_id", "status", "result", "created_at"
     )
     list_filter = ("status",)
+
+
+
+@admin.register(TelegramDialog)
+class TelegramDialogAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "userbot", "dialog_type", "title", "username",
+        "is_admin", "monitored", "members_count", "synced_at",
+    )
+    list_filter = ("dialog_type", "is_admin", "monitored", "userbot")
+    search_fields = ("title", "username", "chat_id")
+
+
+@admin.register(ChatMessage)
+class ChatMessageAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "userbot", "chat_id", "message_id",
+        "sender_name", "media_type", "date",
+    )
+    list_filter = ("userbot", "media_type")
+    search_fields = ("text", "sender_name", "sender_username", "chat_id")
+
+
+@admin.register(EngineCommand)
+class EngineCommandAdmin(admin.ModelAdmin):
+    list_display = ("id", "userbot", "kind", "chat_id", "status", "result", "created_at")
+    list_filter = ("kind", "status")
