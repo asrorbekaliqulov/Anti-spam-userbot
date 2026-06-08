@@ -1,0 +1,46 @@
+{% extends "agents/base.html" %}
+{% block title %}Agents - AntiSpam Agents{% endblock %}
+{% block heading %}Agents (Userbots){% endblock %}
+{% block content %}
+<div class="d-flex justify-content-end mb-3">
+  <a href="{% url 'agents:qr_add' %}" class="btn btn-success"><i class="bi bi-qr-code me-1"></i> Add Userbot (QR)</a>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle text-light">
+      <thead class="text-secondary">
+        <tr><th>#</th><th>Username</th><th>Phone</th><th>Telegram ID</th><th>Status</th><th>Groups</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for bot in bots %}
+        <tr>
+          <td>{{ bot.id }}</td>
+          <td><i class="bi bi-robot me-1"></i>{{ bot.username|default:"-" }}</td>
+          <td>{{ bot.phone|default:"-" }}</td>
+          <td class="small text-secondary">{{ bot.telegram_id|default:"-" }}</td>
+          <td>
+            {% if bot.status == 'active' %}<span class="badge text-bg-success">active</span>
+            {% elif bot.status == 'connecting' %}<span class="badge text-bg-warning">connecting</span>
+            {% else %}<span class="badge text-bg-secondary">disconnected</span>{% endif %}
+          </td>
+          <td>
+            {% for g in bot.groups.all %}
+              <span class="badge text-bg-dark border">{{ g.title|default:g.chat_id }}</span>
+            {% empty %}<span class="text-secondary small">none</span>{% endfor %}
+          </td>
+          <td class="text-end">
+            <form method="post" action="{% url 'agents:delete_userbot' bot.id %}" onsubmit="return confirm('Delete this userbot?');">
+              {% csrf_token %}
+              <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+            </form>
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="7" class="text-center text-secondary py-4">No userbots yet. Click "Add Userbot (QR)".</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

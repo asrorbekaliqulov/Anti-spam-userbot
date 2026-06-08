@@ -1,0 +1,62 @@
+{% extends "agents/base.html" %}
+{% block title %}Security Logs - AntiSpam Agents{% endblock %}
+{% block heading %}Security Logs (live){% endblock %}
+{% block content %}
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <span class="text-secondary small"><i class="bi bi-broadcast text-success"></i> auto-refreshing every 2s</span>
+    <span id="rowcount" class="badge text-bg-secondary">0 rows</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle text-light">
+      <thead class="text-secondary">
+        <tr>
+          <th>Time</th><th>Group</th><th>Agent</th><th>Spammer</th>
+          <th>Action</th><th>Stage</th><th>Detail</th>
+        </tr>
+      </thead>
+      <tbody id="logbody">
+        <tr><td colspan="7" class="text-center text-secondary py-4">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function stageBadge(stage){
+  const map = {blacklist:'danger', spam_cache:'warning', regex:'info', ai:'primary'};
+  const cls = map[stage] || 'secondary';
+  return `<span class="badge badge-stage text-bg-${cls}">${stage||'-'}</span>`;
+}
+function actionBadge(a){
+  const danger = a.toLowerCase().includes('ban');
+  return `<span class="badge text-bg-${danger?'danger':'secondary'}">${a}</span>`;
+}
+async function loadLogs(){
+  try {
+    const res = await fetch("{% url 'agents:api_logs' %}");
+    const data = await res.json();
+    const body = document.getElementById('logbody');
+    document.getElementById('rowcount').textContent = data.logs.length + ' rows';
+    if(!data.logs.length){
+      body.innerHTML = '<tr><td colspan="7" class="text-center text-secondary py-4">No events yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = data.logs.map(r => `
+      <tr>
+        <td class="text-nowrap small">${r.timestamp}</td>
+        <td>${r.group}</td>
+        <td><i class="bi bi-robot"></i> ${r.agent}</td>
+        <td class="text-warning">${r.spammer}</td>
+        <td>${actionBadge(r.action)}</td>
+        <td>${stageBadge(r.stage)}</td>
+        <td class="small text-secondary">${r.detail}</td>
+      </tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+loadLogs();
+setInterval(loadLogs, 2000);
+</script>
+{% endblock %}

@@ -1,0 +1,126 @@
+{% extends "agents/base.html" %}
+{% block title %}Add Userbot - AntiSpam Agents{% endblock %}
+{% block heading %}Add Userbot via QR-code{% endblock %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card p-4 text-center">
+      <h6 class="text-secondary mb-3">Scan with Telegram</h6>
+
+      <div id="qrbox" class="d-inline-block bg-white p-3 rounded-3 mx-auto" style="min-width:240px;min-height:240px;">
+        <div id="qr-placeholder" class="text-dark pt-5">
+          <div class="spinner-border text-success" role="status"></div>
+          <div class="mt-2 small">Generating QR...</div>
+        </div>
+        <img id="qrimg" class="img-fluid d-none" alt="QR login">
+      </div>
+
+      <div id="status" class="mt-3 badge text-bg-secondary">initializing</div>
+      <div id="countdown" class="text-secondary small mt-2"></div>
+
+      <button id="startBtn" class="btn btn-success mt-3 d-none">
+        <i class="bi bi-arrow-clockwise me-1"></i> Restart QR
+      </button>
+    </div>
+  </div>
+
+  <div class="col-lg-7">
+    <div class="card p-4">
+      <h6 class="text-secondary">How to link a new agent</h6>
+      <ol class="text-light small lh-lg mb-3">
+        <li>On the phone with the userbot account, open <b>Telegram</b>.</li>
+        <li>Go to <b>Settings &rarr; Devices &rarr; Link Desktop Device</b>.</li>
+        <li>Point the camera at the QR code on the left.</li>
+        <li>The session is captured automatically and saved as an <b>active</b> agent.</li>
+      </ol>
+      <div class="alert alert-dark border small mb-0">
+        <i class="bi bi-info-circle text-info"></i>
+        The QR token expires roughly every 30&nbsp;seconds and is refreshed for you
+        automatically. No SMS code is required.
+      </div>
+      <div id="successBox" class="alert alert-success mt-3 d-none">
+        <i class="bi bi-check-circle"></i> Userbot <b id="successName"></b> linked successfully!
+        <a href="{% url 'agents:userbots' %}" class="alert-link">View agents &rarr;</a>
+      </div>
+      <div id="errorBox" class="alert alert-danger mt-3 d-none"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{% csrf_token %}
+<script>
+const csrftoken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+let sessionId = null, poller = null, expiresAt = 0, countdownTimer = null;
+
+function setStatus(text, cls){
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'mt-3 badge text-bg-' + cls;
+}
+
+async function startQR(){
+  document.getElementById('successBox').classList.add('d-none');
+  document.getElementById('errorBox').classList.add('d-none');
+  document.getElementById('startBtn').classList.add('d-none');
+  document.getElementById('qrimg').classList.add('d-none');
+  document.getElementById('qr-placeholder').classList.remove('d-none');
+  setStatus('initializing', 'secondary');
+
+  const res = await fetch("{% url 'agents:api_qr_start' %}", {
+    method: 'POST',
+    headers: {'X-CSRFToken': csrftoken}
+  });
+  const data = await res.json();
+  sessionId = data.session_id;
+  if(poller) clearInterval(poller);
+  poller = setInterval(pollQR, 2000);
+}
+
+function startCountdown(){
+  if(countdownTimer) clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    const left = Math.max(0, Math.round(expiresAt - Date.now()/1000));
+    document.getElementById('countdown').textContent =
+      left > 0 ? `token refreshes in ~${left}s` : 'refreshing token...';
+  }, 1000);
+}
+
+async function pollQR(){
+  if(!sessionId) return;
+  const res = await fetch("{% url 'agents:api_qr_status' %}?sid=" + sessionId);
+  const s = await res.json();
+
+  if(s.qr_png_b64){
+    const img = document.getElementById('qrimg');
+    img.src = 'data:image/png;base64,' + s.qr_png_b64;
+    img.classList.remove('d-none');
+    document.getElementById('qr-placeholder').classList.add('d-none');
+    expiresAt = s.expires_at; startCountdown();
+  }
+
+  if(s.status === 'waiting'){ setStatus('waiting for scan', 'info'); }
+  else if(s.status === 'pending'){ setStatus('initializing', 'secondary'); }
+  else if(s.status === 'success'){
+    setStatus('linked!', 'success');
+    clearInterval(poller); clearInterval(countdownTimer);
+    document.getElementById('countdown').textContent = '';
+    document.getElementById('successName').textContent = s.username || ('#' + s.userbot_id);
+    document.getElementById('successBox').classList.remove('d-none');
+    document.getElementById('startBtn').classList.remove('d-none');
+  }
+  else if(s.status === 'expired' || s.status === 'error'){
+    setStatus(s.status, 'danger');
+    clearInterval(poller); clearInterval(countdownTimer);
+    const box = document.getElementById('errorBox');
+    box.textContent = s.error || 'QR expired. Please restart.';
+    box.classList.remove('d-none');
+    document.getElementById('startBtn').classList.remove('d-none');
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', startQR);
+startQR();
+</script>
+{% endblock %}

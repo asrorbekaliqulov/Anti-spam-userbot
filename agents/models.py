@@ -1,0 +1,166 @@
+"""
+Database architecture for the Anti-Spam Agent Platform.
+
+The DB is the single source of truth shared between the synchronous Django
+dashboard and the asynchronous Pyrogram engine. The engine reads configuration
+(which userbots are active, which groups to monitor, the blacklist/spam cache)
+and writes back results (new sessions, security logs, freshly detected spam).
+"""
+from django.db import models
+from django.utils import timezone
+
+
+class UserBot(models.Model):
+    """A single Telegram userbot ("Agent") controlled by the platform."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        DISCONNECTED = "disconnected", "Disconnected"
+        CONNECTING = "connecting", "Connecting"
+
+    # Pyrogram StringSession produced after a successful QR login.
+    session_string = models.TextField(blank=True, default="")
+    phone = models.CharField(max_length=32, blank=True, default="")
+    username = models.CharField(max_length=64, blank=True, default="")
+    telegram_id = models.BigIntegerField(null=True, blank=True)
+
+    # Per-bot API credentials (fall back to settings defaults when empty).
+    api_id = models.IntegerField(null=True, blank=True)
+    api_hash = models.CharField(max_length=64, blank=True, default="")
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.CONNECTING
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        label = self.username or self.phone or f"bot#{self.pk}"
+        return f"{label} ({self.status})"
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.session_string) and self.status == self.Status.ACTIVE
+
+
+class TelegramGroup(models.Model):
+    """A group/supergroup that a userbot is monitoring."""
+
+    chat_id = models.BigIntegerField()
+    title = models.CharField(max_length=255, blank=True, default="")
+    invite_link = models.CharField(max_length=255, blank=True, default="")
+    monitored_by = models.ForeignKey(
+        UserBot,
+        on_delete=models.CASCADE,
+        related_name="groups",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["chat_id", "monitored_by"],
+                name="unique_group_per_bot",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.title or self.chat_id}"
+
+
+class BlacklistUser(models.Model):
+    """Known spammer accounts. Stage-1 fast lookup keys off telegram_id."""
+
+    telegram_id = models.BigIntegerField(unique=True, db_index=True)
+    username = models.CharField(max_length=64, blank=True, default="")
+    first_name = models.CharField(max_length=128, blank=True, default="")
+    bio = models.TextField(blank=True, default="")
+    reason_text = models.CharField(max_length=255, blank=True, default="")
+    detected_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-detected_at"]
+
+    def __str__(self) -> str:
+        return f"{self.username or self.first_name or self.telegram_id}"
+
+
+class SpamContent(models.Model):
+    """
+    Fingerprints of known spam payloads.
+
+    For text we store an MD5 of the normalised message; for images/GIFs we store
+    a perceptual hash (pHash) so visually-identical media is matched even after
+    re-compression.
+    """
+
+    class ContentType(models.TextChoices):
+        TEXT = "text", "Text"
+        GIF = "gif", "GIF"
+        PHOTO = "photo", "Photo"
+
+    content_type = models.CharField(max_length=8, choices=ContentType.choices)
+    # MD5 (text) or pHash (media). Indexed + unique for O(1) fast-path lookups.
+    content_hash = models.CharField(max_length=64, db_index=True)
+    raw_data = models.TextField(
+        blank=True,
+        default="",
+        help_text="Original text, or a short descriptor for media.",
+    )
+    hits = models.PositiveIntegerField(default=0)
+    added_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-added_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["content_type", "content_hash"],
+                name="unique_content_fingerprint",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.content_type}:{self.content_hash[:12]}"
+
+
+class SecurityLog(models.Model):
+    """Audit trail of every protective action taken by an agent."""
+
+    class Action(models.TextChoices):
+        DELETED = "deleted", "Message deleted"
+        BANNED = "banned", "User banned"
+        DELETED_AND_BANNED = "deleted_banned", "Deleted + Banned"
+        FLAGGED = "flagged", "Flagged (AI)"
+
+    group = models.ForeignKey(
+        TelegramGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="logs",
+    )
+    handled_by = models.ForeignKey(
+        UserBot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="logs",
+    )
+    spammer_id = models.BigIntegerField(null=True, blank=True)
+    spammer_username = models.CharField(max_length=64, blank=True, default="")
+    action_taken = models.CharField(max_length=24, choices=Action.choices)
+    # Which pipeline stage triggered the action (blacklist / regex / ai).
+    stage = models.CharField(max_length=32, blank=True, default="")
+    detail = models.CharField(max_length=512, blank=True, default="")
+    timestamp = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ["-timestamp"]
+
+    def __str__(self) -> str:
+        return f"{self.action_taken} {self.spammer_id} @ {self.timestamp:%Y-%m-%d %H:%M}"

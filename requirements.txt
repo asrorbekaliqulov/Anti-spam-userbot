@@ -1,0 +1,27 @@
+# --- Core ---
+Django==5.0.6
+python-dotenv==1.0.1
+
+# --- Telegram (userbot engine) ---
+pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# --- Hybrid filter / AI ---
+openai==1.30.5
+
+# --- Image perceptual hashing (pHash) for GIF/photo spam ---
+Pillow==10.3.0
+imagehash==4.3.1
+
+# --- QR-code rendering for userbot login ---
+qrcode==7.4.2
+
+# --- Async helpers ---
+aiohttp==3.9.5
+
+# --- Production server (optional) ---
+gunicorn==22.0.0
+
+# NOTE:
+#   Pyrogram 2.x ships with its own MTProto implementation. TgCrypto is an
+#   optional but strongly recommended C-extension that speeds up encryption.

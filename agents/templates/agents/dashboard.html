@@ -1,0 +1,91 @@
+{% extends "agents/base.html" %}
+{% block title %}Dashboard - AntiSpam Agents{% endblock %}
+{% block heading %}Dashboard{% endblock %}
+{% block content %}
+<div class="row g-3 mb-4">
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-people me-1"></i>Monitored Groups</div>
+      <div class="num text-info">{{ total_groups }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-robot me-1"></i>Active Agents</div>
+      <div class="num text-success">{{ active_agents }}<span class="fs-6 text-secondary">/{{ total_agents }}</span></div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-slash-circle me-1"></i>Blocked Today</div>
+      <div class="num text-danger">{{ blocked_today }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-fingerprint me-1"></i>Spam Signatures</div>
+      <div class="num text-warning">{{ spam_signatures }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <div class="card p-3 h-100">
+      <h6 class="text-secondary">Blocked bots - last 7 days</h6>
+      <canvas id="dailyChart" height="110"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card p-3 h-100">
+      <h6 class="text-secondary">Detections by stage</h6>
+      <canvas id="stageChart" height="110"></canvas>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadStats() {
+  const res = await fetch("{% url 'agents:api_stats' %}");
+  const data = await res.json();
+
+  new Chart(document.getElementById('dailyChart'), {
+    type: 'bar',
+    data: {
+      labels: data.daily.labels,
+      datasets: [{
+        label: 'Deleted + Banned',
+        data: data.daily.values,
+        backgroundColor: 'rgba(220,53,69,0.6)',
+        borderColor: 'rgba(220,53,69,1)',
+        borderWidth: 1, borderRadius: 6
+      },{
+        label: 'Trend',
+        data: data.daily.values,
+        type: 'line',
+        borderColor: 'rgba(13,202,240,1)',
+        backgroundColor: 'rgba(13,202,240,0.2)',
+        tension: 0.35, fill: true, pointRadius: 3
+      }]
+    },
+    options: { responsive:true, plugins:{legend:{labels:{color:'#aeb6c2'}}},
+      scales:{x:{ticks:{color:'#7c8696'}},y:{ticks:{color:'#7c8696'},beginAtZero:true}} }
+  });
+
+  new Chart(document.getElementById('stageChart'), {
+    type: 'doughnut',
+    data: {
+      labels: data.stages.labels,
+      datasets: [{
+        data: data.stages.values,
+        backgroundColor: ['#dc3545','#fd7e14','#0dcaf0','#198754','#6f42c1']
+      }]
+    },
+    options: { plugins:{legend:{position:'bottom',labels:{color:'#aeb6c2'}}} }
+  });
+}
+loadStats();
+</script>
+{% endblock %}
