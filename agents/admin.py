@@ -2,6 +2,8 @@ from django.contrib import admin
 
 from .models import (
     BlacklistUser,
+    FilterRule,
+    PropagationJob,
     SecurityLog,
     SpamContent,
     TelegramGroup,
@@ -52,3 +54,19 @@ class SecurityLogAdmin(admin.ModelAdmin):
     list_filter = ("action_taken", "stage", "group")
     search_fields = ("spammer_id", "spammer_username", "detail")
     date_hierarchy = "timestamp"
+
+
+
+@admin.register(FilterRule)
+class FilterRuleAdmin(admin.ModelAdmin):
+    list_display = ("id", "rule_type", "pattern", "is_active", "hits", "created_at")
+    list_filter = ("rule_type", "is_active")
+    search_fields = ("pattern", "note")
+
+
+@admin.register(PropagationJob)
+class PropagationJobAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "admin_bot", "new_bot", "chat_id", "status", "result", "created_at"
+    )
+    list_filter = ("status",)

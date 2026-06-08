@@ -33,6 +33,8 @@
         <li class="nav-item"><a class="nav-link {% if active == 'dashboard' %}active{% endif %}" href="{% url 'agents:dashboard' %}"><i class="bi bi-speedometer2 me-2"></i>Dashboard</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'userbots' %}active{% endif %}" href="{% url 'agents:userbots' %}"><i class="bi bi-robot me-2"></i>Agents (Userbots)</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'logs' %}active{% endif %}" href="{% url 'agents:logs' %}"><i class="bi bi-card-list me-2"></i>Security Logs</a></li>
+        <li class="nav-item"><a class="nav-link {% if active == 'filters' %}active{% endif %}" href="{% url 'agents:filters' %}"><i class="bi bi-funnel me-2"></i>Filter Rules</a></li>
+        <li class="nav-item"><a class="nav-link {% if active == 'propagation' %}active{% endif %}" href="{% url 'agents:propagation' %}"><i class="bi bi-diagram-3 me-2"></i>Propagation</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'qr_add' %}active{% endif %}" href="{% url 'agents:qr_add' %}"><i class="bi bi-qr-code me-2"></i>Add Userbot</a></li>
         <li class="nav-item mt-3"><a class="nav-link" href="/admin/"><i class="bi bi-gear me-2"></i>Django Admin</a></li>
       </ul>
@@ -44,10 +46,19 @@
         <h4 class="text-white mb-0">{% block heading %}{% endblock %}</h4>
         <div class="text-secondary small">{{ request.user.username }} &middot; <a href="/admin/logout/" class="text-secondary">logout</a></div>
       </div>
+      {% if messages %}
+        {% for m in messages %}
+        <div class="alert alert-{{ m.tags|default:'info' }} alert-dismissible fade show py-2" role="alert">
+          {{ m }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        {% endfor %}
+      {% endif %}
       {% block content %}{% endblock %}
     </main>
   </div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

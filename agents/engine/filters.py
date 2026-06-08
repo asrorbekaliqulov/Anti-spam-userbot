@@ -18,6 +18,7 @@ carrying out the Telegram action (delete/ban) and writing the SecurityLog.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 
 from asgiref.sync import sync_to_async
@@ -27,8 +28,14 @@ from .ai_filter import classifier
 
 # --------------------------------------------------------------------------- #
 #  Stage-2 heuristics
+#
+#  Detection rules (keywords, emojis, regex) are managed from the dashboard and
+#  stored in the `FilterRule` table. The engine caches the active rules for a
+#  short TTL so edits made in the web process reach the (separate) engine
+#  process within a few seconds. If the table is empty (fresh install) we fall
+#  back to the built-in defaults below so protection works out of the box.
 # --------------------------------------------------------------------------- #
-SUSPICIOUS_KEYWORDS = [
+DEFAULT_KEYWORDS = [
     # Uzbek / Russian / English bait commonly seen in adult-scam userbots.
     "profilimda", "profilim", "bio'mda", "biomda", "biomga", "sovg'a", "sovga",
     "bepul", "bosing", "havola", "kanalga", "kanalimga", "obuna",
@@ -38,13 +45,26 @@ SUSPICIOUS_KEYWORDS = [
     "переходи", "ссылк", "бесплатно", "интим", "эротик",
 ]
 
-ADULT_EMOJIS = ["💋", "🔞", "💦", "🍑", "🍆", "👅", "😈", "🥵", "🔥"]
+DEFAULT_EMOJIS = ["💋", "🔞", "💦", "🍑", "🍆", "👅", "😈", "🥵", "🔥"]
 
-_KEYWORD_RE = re.compile(
-    "|".join(re.escape(k) for k in SUSPICIOUS_KEYWORDS), re.IGNORECASE
-)
 # t.me / external invite links are a strong secondary signal.
-_LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|@[\w]{4,})", re.IGNORECASE)
+DEFAULT_REGEXES = [r"(https?://|t\.me/|telegram\.me/|@[\w]{4,})"]
+
+# Seeds used by the data migration so the rules show up (and are editable) in
+# the dashboard from day one.
+DEFAULT_RULE_SEEDS = (
+    [("keyword", k) for k in DEFAULT_KEYWORDS]
+    + [("emoji", e) for e in DEFAULT_EMOJIS]
+    + [("regex", r) for r in DEFAULT_REGEXES]
+)
+
+_RULE_TTL = 15.0  # seconds
+_rule_cache: dict = {
+    "loaded_at": 0.0,
+    "keyword_re": None,
+    "emojis": [],
+    "regexes": [],
+}
 
 
 @dataclass
@@ -77,16 +97,63 @@ def _spam_content_hit(content_type: str, content_hash: str) -> bool:
     return False
 
 
-def _stage2_flag(text: str) -> tuple[bool, str]:
+@sync_to_async
+def _fetch_active_rules() -> list[tuple[str, str]]:
+    from agents.models import FilterRule
+
+    return list(
+        FilterRule.objects.filter(is_active=True).values_list("rule_type", "pattern")
+    )
+
+
+def reset_rule_cache() -> None:
+    """Force the next stage-2 check to reload rules (used right after edits)."""
+    _rule_cache["loaded_at"] = 0.0
+
+
+async def _ensure_rules() -> None:
+    now = time.time()
+    if _rule_cache["loaded_at"] and now - _rule_cache["loaded_at"] < _RULE_TTL:
+        return
+
+    rows = await _fetch_active_rules()
+    keywords = [p for t, p in rows if t == "keyword"]
+    emojis = [p for t, p in rows if t == "emoji"]
+    regexes = [p for t, p in rows if t == "regex"]
+
+    if not rows:  # empty table -> built-in defaults
+        keywords, emojis, regexes = DEFAULT_KEYWORDS, DEFAULT_EMOJIS, DEFAULT_REGEXES
+
+    _rule_cache["keyword_re"] = (
+        re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE)
+        if keywords
+        else None
+    )
+    _rule_cache["emojis"] = emojis
+    compiled = []
+    for pat in regexes:
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error:
+            continue  # skip an invalid pattern rather than crash the engine
+    _rule_cache["regexes"] = compiled
+    _rule_cache["loaded_at"] = now
+
+
+async def _stage2_flag(text: str) -> tuple[bool, str]:
+    await _ensure_rules()
     if not text:
         return False, ""
     reasons = []
-    if _KEYWORD_RE.search(text):
+    kre = _rule_cache["keyword_re"]
+    if kre and kre.search(text):
         reasons.append("keyword")
-    if any(e in text for e in ADULT_EMOJIS):
+    if any(e in text for e in _rule_cache["emojis"]):
         reasons.append("adult-emoji")
-    if _LINK_RE.search(text):
-        reasons.append("link/mention")
+    for rx in _rule_cache["regexes"]:
+        if rx.search(text):
+            reasons.append("regex")
+            break
     return (bool(reasons), ",".join(reasons))
 
 
@@ -115,7 +182,7 @@ async def precheck(
         return Verdict(True, "spam_cache", reason=f"known {content_type} fingerprint")
 
     # --- Stage 2: regex / emoji heuristics -------------------------------- #
-    suspicious, why = _stage2_flag(text)
+    suspicious, why = await _stage2_flag(text)
     if not suspicious:
         return Verdict(False, "clean")
 

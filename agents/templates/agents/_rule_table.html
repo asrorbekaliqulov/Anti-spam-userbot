@@ -1,0 +1,36 @@
+<div class="col-lg-4">
+  <div class="card p-3 h-100">
+    <h6 class="text-secondary mb-3"><i class="bi {{ icon }} me-1"></i>{{ title }}
+      <span class="badge text-bg-dark border float-end">{{ rules|length }}</span>
+    </h6>
+    <div class="table-responsive" style="max-height:60vh;overflow:auto;">
+      <table class="table table-sm table-hover align-middle text-light mb-0">
+        <tbody>
+          {% for r in rules %}
+          <tr>
+            <td class="{% if not r.is_active %}text-secondary text-decoration-line-through{% endif %}">
+              <code class="text-warning">{{ r.pattern }}</code>
+              {% if r.note %}<div class="small text-secondary">{{ r.note }}</div>{% endif %}
+            </td>
+            <td class="text-end text-nowrap">
+              <form method="post" action="{% url 'agents:toggle_rule' r.id %}" class="d-inline">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-{% if r.is_active %}success{% else %}secondary{% endif %}" title="toggle">
+                  <i class="bi bi-{% if r.is_active %}toggle-on{% else %}toggle-off{% endif %}"></i>
+                </button>
+              </form>
+              <form method="post" action="{% url 'agents:delete_rule' r.id %}" class="d-inline"
+                    onsubmit="return confirm('Delete this rule?');">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-danger" title="delete"><i class="bi bi-trash"></i></button>
+              </form>
+            </td>
+          </tr>
+          {% empty %}
+          <tr><td class="text-secondary small py-3">No {{ title|lower }} yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
