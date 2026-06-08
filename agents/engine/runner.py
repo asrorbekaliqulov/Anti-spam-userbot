@@ -21,7 +21,7 @@ from django.conf import settings
 from django.utils import timezone as djtz
 
 from pyrogram import Client, filters as pf
-from pyrogram.enums import ChatType, ChatMemberStatus
+from pyrogram.enums import ChatType, ChatMemberStatus, ChatMembersFilter
 from pyrogram.handlers import MessageHandler
 
 from . import repository as repo
@@ -44,6 +44,10 @@ class AgentRunner:
         self._cmd_task: asyncio.Task | None = None
         # bot_id -> (set_of_chat_ids, loaded_at)
         self._monitor_cache: dict[int, tuple[set[int], float]] = {}
+        # bot_id -> own telegram user id (to detect self / own admin rights)
+        self._self_ids: dict[int, int] = {}
+        # chat_id -> (set_of_admin_user_ids, loaded_at)
+        self._admin_cache: dict[int, tuple[set[int], float]] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -93,6 +97,11 @@ class AgentRunner:
         )
         await client.start()
         self.clients[bot["id"]] = client
+        try:
+            me = await client.get_me()
+            self._self_ids[bot["id"]] = me.id
+        except Exception:  # noqa: BLE001
+            self._self_ids[bot["id"]] = bot.get("telegram_id") or 0
         await repo.set_bot_status(bot["id"], "active")
         logger.info("UserBot #%s (%s) started.", bot["id"], bot.get("username"))
 
@@ -103,6 +112,26 @@ class AgentRunner:
 
         text = message.text or message.caption or ""
         content_type, content_hash, photo_path = await self._fingerprint(client, message)
+
+        # Resolve the sender's role (admin / bot / scam / user / me) and archive
+        # the message immediately - we keep EVERY message in a monitored group.
+        role = await self._sender_role(client, message.chat.id, bot_id, sender)
+        await repo.save_group_message(
+            bot_id,
+            message.chat.id,
+            {
+                "message_id": message.id,
+                "sender_id": sender.id,
+                "sender_name": self._display_name(sender),
+                "sender_username": sender.username or "",
+                "sender_role": role,
+                "tg_scam_flag": bool(getattr(sender, "is_scam", False)
+                                     or getattr(sender, "is_fake", False)),
+                "text": text,
+                "media_type": (message.media.value if message.media else ""),
+                "date": self._aware(message.date),
+            },
+        )
 
         try:
             # --- Stages 1 & 2 (cheap, no network) ------------------------- #
@@ -131,6 +160,7 @@ class AgentRunner:
                         userbot_id=bot_id,
                         spammer_id=sender.id,
                         spammer_username=sender.username or "",
+                        message_id=message.id,
                         action="flagged",
                         stage=verdict.stage,
                         detail=verdict.reason,
@@ -140,17 +170,9 @@ class AgentRunner:
             if not verdict.is_spam:
                 return  # clean message
 
-            # --- Confirmed spam: enforce ---------------------------------- #
-            await delete_and_ban(client, message.chat.id, message.id, sender.id)
-            await repo.record_action(
-                chat_id=message.chat.id,
-                userbot_id=bot_id,
-                spammer_id=sender.id,
-                spammer_username=sender.username or "",
-                action="deleted_banned",
-                stage=verdict.stage,
-                detail=verdict.reason,
-            )
+            # --- Confirmed spam ------------------------------------------- #
+            # Mark the archived message's sender as scam.
+            await repo.set_group_message_role(bot_id, message.chat.id, message.id, "scam")
 
             # Persist learning so future identical spam skips the AI entirely.
             if verdict.should_cache:
@@ -167,12 +189,128 @@ class AgentRunner:
                         raw_data=text,
                     )
 
-            logger.info(
-                "BANNED %s in chat %s [%s] - %s",
-                sender.id, message.chat.id, verdict.stage, verdict.reason,
-            )
+            # Enforce - directly if we are admin, otherwise via the helper bot.
+            await self._enforce(client, message, bot_id, sender, verdict)
         finally:
             self._cleanup(photo_path)
+
+    async def _enforce(self, client, message, bot_id, sender, verdict) -> None:
+        chat_id = message.chat.id
+        cfg = await repo.group_config(bot_id, chat_id)
+        i_am_admin = await self._self_is_admin(client, chat_id, bot_id)
+
+        if i_am_admin:
+            await delete_and_ban(client, chat_id, message.id, sender.id)
+            await repo.record_action(
+                chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
+                spammer_username=sender.username or "", message_id=message.id,
+                action="deleted_banned", stage=verdict.stage, detail=verdict.reason,
+            )
+            logger.info("BANNED %s in chat %s [%s]", sender.id, chat_id, verdict.stage)
+            return
+
+        # Not admin: hand off to the helper account (if configured).
+        helper_id = cfg.get("helper_bot_id") if cfg else None
+        reported = await self._report_to_helper(
+            helper_id, chat_id, message.id, sender.id, verdict.reason
+        )
+        action = "reported" if reported else "flagged"
+        detail = (
+            f"not admin; reported to helper bot#{helper_id}: "
+            f"msg_id={message.id} user_id={sender.id} ({verdict.reason})"
+            if reported
+            else f"not admin and no helper available ({verdict.reason})"
+        )
+        await repo.record_action(
+            chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
+            spammer_username=sender.username or "", message_id=message.id,
+            action=action, stage=verdict.stage, detail=detail,
+        )
+        logger.info("SCAM %s in chat %s -> %s", sender.id, chat_id, action)
+
+    async def _report_to_helper(
+        self, helper_bot_id, chat_id, message_id, user_id, reason
+    ) -> bool:
+        """
+        When the monitoring bot lacks admin rights, write the offending
+        message_id + spammer user_id to the helper account, and let the helper
+        enforce the ban if it is admin in the chat.
+        """
+        if not helper_bot_id:
+            return False
+        helper = self.clients.get(helper_bot_id)
+        if helper is None:
+            return False  # helper not running in this engine instance
+
+        note = (
+            "🚨 Anti-Spam report\n"
+            f"chat_id: {chat_id}\n"
+            f"message_id: {message_id}\n"
+            f"user_id: {user_id}\n"
+            f"reason: {reason}"
+        )
+        try:
+            # "Write to that additional account": its own Saved Messages.
+            await safe_call(lambda: helper.send_message("me", note), what="report_send")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # If the helper is admin in the chat, let it actually delete + ban.
+        try:
+            if await self._self_is_admin(helper, chat_id, helper_bot_id):
+                await delete_and_ban(helper, chat_id, message_id, user_id)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    @staticmethod
+    def _display_name(user) -> str:
+        name = " ".join(
+            p for p in [user.first_name or "", user.last_name or ""] if p
+        )
+        return name or user.username or str(user.id)
+
+    @staticmethod
+    def _aware(dt):
+        if dt and djtz.is_naive(dt):
+            return djtz.make_aware(dt)
+        return dt
+
+    async def _group_admins(self, client: Client, chat_id: int) -> set[int]:
+        cached = self._admin_cache.get(chat_id)
+        now = time.time()
+        if cached and now - cached[1] < 60:
+            return cached[0]
+        admins: set[int] = set()
+        try:
+            async for m in client.get_chat_members(
+                chat_id, filter=ChatMembersFilter.ADMINISTRATORS
+            ):
+                if m.user:
+                    admins.add(m.user.id)
+        except Exception:  # noqa: BLE001
+            pass
+        self._admin_cache[chat_id] = (admins, now)
+        return admins
+
+    async def _self_is_admin(self, client: Client, chat_id: int, bot_id: int) -> bool:
+        my_id = self._self_ids.get(bot_id)
+        if not my_id:
+            return False
+        return my_id in await self._group_admins(client, chat_id)
+
+    async def _sender_role(self, client, chat_id, bot_id, sender) -> str:
+        if getattr(sender, "is_self", False) or sender.id == self._self_ids.get(bot_id):
+            return "me"
+        if getattr(sender, "is_bot", False):
+            return "bot"
+        if getattr(sender, "is_scam", False) or getattr(sender, "is_fake", False):
+            return "scam"
+        if await repo.is_blacklisted(sender.id):
+            return "scam"
+        if sender.id in await self._group_admins(client, chat_id):
+            return "admin"
+        return "user"
 
     async def _enrich_sender(self, client: Client, user_id: int):
         """Fetch the sender's bio and download their profile photo (for the AI)."""

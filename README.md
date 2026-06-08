@@ -194,3 +194,31 @@ matn/GIF/rasm xeshi `SpamContent` ga yoziladi — keyingi safar bu kontent
 - Telegram **2FA (cloud parol)** qo'llab-quvvatlanadi (QR oqimidagi parol bosqichi).
 - Userbotlardan foydalanish Telegram ToS doirasida, faqat o'zingiz egasi/admin
   bo'lgan guruhlarni himoya qilish uchun amalga oshirilsin.
+
+
+---
+
+## 10. Chat brauzeri, xabar arxivi va helper account
+
+**Chats sahifasi** ulangan accountning barcha chatlarini ko'rsatadi (userlar,
+botlar, guruhlar, kanallar) va ro'yxatdan tanlab anti-spamni yoqish mumkin.
+
+**Guruh monitoringi yoqilganda:**
+- Agar userbot o'sha guruhda **admin bo'lsa** — to'g'ridan-to'g'ri o'chiradi/ban qiladi.
+- Agar **admin bo'lmasa** — ro'yxatdan **qo'shimcha (helper) account** tanlanadi.
+
+**Xabar arxivi (`GroupMessage`):** monitoring yoqilgan guruhdagi **har bir xabar**
+bazaga yoziladi va yuboruvchi roli bilan boyitiladi: `admin`, `user`, `scam`,
+`bot`, `me` (ID bilan emas, ism/username/rol bilan ko'rsatiladi). "Live archive"
+sahifasida real-time o'qish va rol bo'yicha filtrlash mumkin.
+
+**Scam aniqlanganda (AI yoki baza/regex):**
+- userbot admin bo'lsa — xabar o'chiriladi, user ban qilinadi;
+- admin bo'lmasa — helper account'ning **Saved Messages**iga `chat_id`,
+  `message_id` va `user_id` yoziladi; helper o'sha guruhda admin bo'lsa, o'zi
+  o'chiradi/ban qiladi. Har bir holat `SecurityLog`ga (`reported`/`deleted_banned`)
+  message_id bilan yoziladi.
+
+Guruh adminlari ro'yxati va userbotning admin-statusi engine tomonidan TTL-kesh
+(60s) bilan aniqlanadi, shuning uchun `get_chat_member` har bir xabar uchun
+chaqirilmaydi.

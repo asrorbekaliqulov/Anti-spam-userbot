@@ -8,6 +8,10 @@ TgCrypto==1.2.5
 
 # --- Hybrid filter / AI ---
 openai==1.30.5
+# openai 1.30.x passes the `proxies` kwarg to httpx, which was removed in
+# httpx 0.28. Pin httpx to the last 0.27.x to avoid:
+#   "AsyncClient.__init__() got an unexpected keyword argument 'proxies'"
+httpx==0.27.2
 
 # --- Image perceptual hashing (pHash) for GIF/photo spam ---
 Pillow==10.3.0
