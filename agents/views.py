@@ -81,6 +81,7 @@ def filters_page(request):
     ctx = {
         "active": "filters",
         "keywords": rules.filter(rule_type=FilterRule.RuleType.KEYWORD),
+        "phrases": rules.filter(rule_type=FilterRule.RuleType.PHRASE),
         "emojis": rules.filter(rule_type=FilterRule.RuleType.EMOJI),
         "regexes": rules.filter(rule_type=FilterRule.RuleType.REGEX),
         "rule_types": FilterRule.RuleType.choices,

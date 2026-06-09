@@ -264,3 +264,87 @@ def replace_chat_messages(userbot_id: int, chat_id: int, messages: list[dict]) -
     ]
     ChatMessage.objects.bulk_create(objs, ignore_conflicts=True)
     return len(objs)
+
+
+
+# --------------------------------------------------------------------------- #
+#  Monitored-group archive + config
+# --------------------------------------------------------------------------- #
+@sync_to_async
+def group_config(userbot_id: int, chat_id: int) -> dict | None:
+    """Return monitoring config for a (bot, chat): id, admin flag, helper bot."""
+    from agents.models import TelegramGroup
+
+    g = TelegramGroup.objects.filter(
+        monitored_by_id=userbot_id, chat_id=chat_id, is_active=True
+    ).first()
+    if not g:
+        return None
+    return {
+        "group_id": g.id,
+        "monitor_is_admin": g.monitor_is_admin,
+        "helper_bot_id": g.helper_bot_id,
+    }
+
+
+@sync_to_async
+def helper_telegram_id(helper_bot_id: int) -> int | None:
+    from agents.models import UserBot
+
+    bot = UserBot.objects.filter(id=helper_bot_id).first()
+    return bot.telegram_id if bot else None
+
+
+@sync_to_async
+def save_group_message(userbot_id: int, chat_id: int, data: dict) -> None:
+    """Archive one monitored-group message (append-only, enriched with role)."""
+    from agents.models import GroupMessage, TelegramGroup
+
+    group = TelegramGroup.objects.filter(
+        monitored_by_id=userbot_id, chat_id=chat_id
+    ).first()
+    if not group:
+        return
+    GroupMessage.objects.update_or_create(
+        userbot_id=userbot_id,
+        chat_id=chat_id,
+        message_id=data["message_id"],
+        defaults={
+            "group_id": group.id,
+            "sender_id": data.get("sender_id"),
+            "sender_name": data.get("sender_name", "")[:128],
+            "sender_username": data.get("sender_username", "")[:64],
+            "sender_role": data.get("sender_role", "user"),
+            "tg_scam_flag": data.get("tg_scam_flag", False),
+            "text": data.get("text", ""),
+            "media_type": data.get("media_type", "")[:24],
+            "date": data.get("date"),
+        },
+    )
+
+
+@sync_to_async
+def set_group_message_role(
+    userbot_id: int, chat_id: int, message_id: int, role: str
+) -> None:
+    from agents.models import GroupMessage
+
+    GroupMessage.objects.filter(
+        userbot_id=userbot_id, chat_id=chat_id, message_id=message_id
+    ).update(sender_role=role)
+
+
+@sync_to_async
+def set_monitor_admin_flag(userbot_id: int, chat_id: int, is_admin: bool) -> None:
+    from agents.models import TelegramGroup
+
+    TelegramGroup.objects.filter(
+        monitored_by_id=userbot_id, chat_id=chat_id
+    ).update(monitor_is_admin=is_admin)
+
+
+@sync_to_async
+def is_blacklisted(telegram_id: int) -> bool:
+    from agents.models import BlacklistUser
+
+    return BlacklistUser.objects.filter(telegram_id=telegram_id).exists()
