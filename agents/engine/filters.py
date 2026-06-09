@@ -62,6 +62,7 @@ _RULE_TTL = 15.0  # seconds
 _rule_cache: dict = {
     "loaded_at": 0.0,
     "keyword_re": None,
+    "phrases": [],  # normalised full-text patterns (multi-sentence)
     "emojis": [],
     "regexes": [],
 }
@@ -118,22 +119,26 @@ async def _ensure_rules() -> None:
 
     rows = await _fetch_active_rules()
     keywords = [p for t, p in rows if t == "keyword"]
+    phrases = [p for t, p in rows if t == "phrase"]
     emojis = [p for t, p in rows if t == "emoji"]
     regexes = [p for t, p in rows if t == "regex"]
 
     if not rows:  # empty table -> built-in defaults
         keywords, emojis, regexes = DEFAULT_KEYWORDS, DEFAULT_EMOJIS, DEFAULT_REGEXES
+        phrases = []
 
     _rule_cache["keyword_re"] = (
-        re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE)
+        re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE | re.DOTALL)
         if keywords
         else None
     )
+    # Phrases: normalised (lowered, stripped) full-text patterns for contains check.
+    _rule_cache["phrases"] = [p.lower().strip() for p in phrases if p.strip()]
     _rule_cache["emojis"] = emojis
     compiled = []
     for pat in regexes:
         try:
-            compiled.append(re.compile(pat, re.IGNORECASE))
+            compiled.append(re.compile(pat, re.IGNORECASE | re.DOTALL))
         except re.error:
             continue  # skip an invalid pattern rather than crash the engine
     _rule_cache["regexes"] = compiled
@@ -148,6 +153,12 @@ async def _stage2_flag(text: str) -> tuple[bool, str]:
     kre = _rule_cache["keyword_re"]
     if kre and kre.search(text):
         reasons.append("keyword")
+    # Phrase match: check if any full phrase pattern is contained in the message.
+    text_lower = text.lower()
+    for phrase in _rule_cache["phrases"]:
+        if phrase in text_lower:
+            reasons.append("phrase")
+            break
     if any(e in text for e in _rule_cache["emojis"]):
         reasons.append("adult-emoji")
     for rx in _rule_cache["regexes"]:

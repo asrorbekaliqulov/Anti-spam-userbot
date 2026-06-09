@@ -22,6 +22,7 @@ from django.utils import timezone as djtz
 
 from pyrogram import Client, filters as pf
 from pyrogram.enums import ChatType, ChatMemberStatus, ChatMembersFilter
+from pyrogram.errors import ChatAdminRequired
 from pyrogram.handlers import MessageHandler
 
 from . import repository as repo
@@ -94,6 +95,20 @@ class AgentRunner:
         # Only react to group/supergroup messages from real users.
         client.add_handler(
             MessageHandler(handler, pf.group & ~pf.service & ~pf.me)
+        )
+
+        # /count N command in private chat or Saved Messages.
+        async def count_handler(client: Client, message, _bot_id=bot["id"]):
+            try:
+                await self._handle_count_command(client, message, _bot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("/count handler error: %s", exc)
+
+        client.add_handler(
+            MessageHandler(
+                count_handler,
+                pf.private & pf.command("count"),
+            )
         )
         await client.start()
         self.clients[bot["id"]] = client
@@ -174,32 +189,35 @@ class AgentRunner:
             # Mark the archived message's sender as scam.
             await repo.set_group_message_role(bot_id, message.chat.id, message.id, "scam")
 
-            # Persist learning so future identical spam skips the AI entirely.
-            if verdict.should_cache:
-                await repo.add_to_blacklist(
-                    telegram_id=sender.id,
-                    username=sender.username or "",
-                    first_name=sender.first_name or "",
-                    reason=verdict.reason,
-                )
-                if content_hash:
-                    await repo.cache_spam_content(
-                        content_type=content_type,
-                        content_hash=content_hash,
-                        raw_data=text,
-                    )
-
-            # Enforce - directly if we are admin, otherwise via the helper bot.
+            # Enforce - directly if admin, else fallback to helper/saved.
+            # _enforce also blacklists the user + caches the content hash.
             await self._enforce(client, message, bot_id, sender, verdict)
         finally:
             self._cleanup(photo_path)
 
     async def _enforce(self, client, message, bot_id, sender, verdict) -> None:
         chat_id = message.chat.id
+        text = message.text or message.caption or ""
         cfg = await repo.group_config(bot_id, chat_id)
-        i_am_admin = await self._self_is_admin(client, chat_id, bot_id)
 
-        if i_am_admin:
+        # Always blacklist + cache the spam content (regardless of admin rights).
+        if verdict.should_cache:
+            await repo.add_to_blacklist(
+                telegram_id=sender.id,
+                username=sender.username or "",
+                first_name=sender.first_name or "",
+                reason=verdict.reason,
+            )
+        # Cache the content hash so this payload is blocked instantly next time.
+        from .hashing import text_hash as _th
+        content_hash = _th(text) if text.strip() else None
+        if content_hash:
+            await repo.cache_spam_content(
+                content_type="text", content_hash=content_hash, raw_data=text,
+            )
+
+        # Try to enforce directly (delete + ban).
+        try:
             await delete_and_ban(client, chat_id, message.id, sender.id)
             await repo.record_action(
                 chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
@@ -208,18 +226,42 @@ class AgentRunner:
             )
             logger.info("BANNED %s in chat %s [%s]", sender.id, chat_id, verdict.stage)
             return
+        except ChatAdminRequired:
+            # Not admin — graceful fallback below.
+            logger.warning(
+                "Not admin in chat %s, falling back to helper/saved", chat_id,
+            )
 
-        # Not admin: hand off to the helper account (if configured).
+        # --- Fallback: report to helper account or Saved Messages ---------- #
         helper_id = cfg.get("helper_bot_id") if cfg else None
         reported = await self._report_to_helper(
             helper_id, chat_id, message.id, sender.id, verdict.reason
         )
+
+        if not reported:
+            # No helper available — write to the monitoring bot's own Saved Messages.
+            note = (
+                "🚨 Anti-Spam: no admin rights\n"
+                f"chat_id: {chat_id}\n"
+                f"message_id: {message.id}\n"
+                f"user_id: {sender.id}\n"
+                f"username: @{sender.username or '—'}\n"
+                f"reason: {verdict.reason}\n"
+                f"Action: user+content blacklisted. Cannot delete/ban (not admin)."
+            )
+            try:
+                await safe_call(
+                    lambda: client.send_message("me", note), what="self_report"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
         action = "reported" if reported else "flagged"
         detail = (
             f"not admin; reported to helper bot#{helper_id}: "
             f"msg_id={message.id} user_id={sender.id} ({verdict.reason})"
             if reported
-            else f"not admin and no helper available ({verdict.reason})"
+            else f"not admin; blacklisted + written to Saved Messages ({verdict.reason})"
         )
         await repo.record_action(
             chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
@@ -262,6 +304,34 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    async def _handle_count_command(self, client: Client, message, bot_id: int) -> None:
+        """
+        Respond to /count N in private chat.
+        Returns how many messages were deleted/banned in the last N hours.
+        Also works via Saved Messages: /count 20 -> "last 20 hours: X banned".
+        """
+        args = message.text.split()
+        hours = 24  # default
+        if len(args) > 1:
+            try:
+                hours = int(args[1])
+            except ValueError:
+                await message.reply(
+                    "Usage: /count <hours>\nExample: /count 20"
+                )
+                return
+
+        hours = max(1, min(hours, 720))  # cap at 30 days
+        count = await repo.count_actions_in_hours(bot_id, hours)
+        text = (
+            f"📊 Anti-Spam statistics (last {hours}h):\n"
+            f"• Deleted + Banned: {count['deleted_banned']}\n"
+            f"• Reported to helper: {count['reported']}\n"
+            f"• Flagged (AI review): {count['flagged']}\n"
+            f"• Total actions: {count['total']}"
+        )
+        await message.reply(text)
 
     @staticmethod
     def _display_name(user) -> str:

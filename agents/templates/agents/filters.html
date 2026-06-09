@@ -33,6 +33,7 @@
 
 <div class="row g-3">
   {% include "agents/_rule_table.html" with title="Keywords" icon="bi-chat-left-text" rules=keywords %}
+  {% include "agents/_rule_table.html" with title="Phrases (full text)" icon="bi-chat-quote" rules=phrases %}
   {% include "agents/_rule_table.html" with title="Emojis" icon="bi-emoji-sunglasses" rules=emojis %}
   {% include "agents/_rule_table.html" with title="Regex patterns" icon="bi-regex" rules=regexes %}
 </div>
@@ -43,11 +44,13 @@
 <script>
 const hints = {
   keyword: "Keyword = case-insensitive substring match (e.g. 'profilimda').",
+  phrase: "Phrase = full multi-sentence text (case-insensitive contains). Paste entire spam messages here.",
   emoji: "Emoji = exact emoji to look for (e.g. 🔞).",
   regex: "Regex = Python regular expression (e.g. t\\.me/\\w+). Validated on save."
 };
 const ph = {
   keyword: "e.g. profilimda",
+  phrase: "e.g. mening profilimga kiring va ko'ring",
   emoji: "e.g. 🔞",
   regex: "e.g. t\\.me/\\w+"
 };

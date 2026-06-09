@@ -38,7 +38,17 @@ class AIClassifier:
         if self._client is None:
             from openai import AsyncOpenAI
 
-            self._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            try:
+                self._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            except TypeError:
+                # openai 1.30.x passes `proxies=` to httpx.AsyncClient which was
+                # removed in httpx>=0.28. Work around by supplying our own client.
+                import httpx
+
+                self._client = AsyncOpenAI(
+                    api_key=settings.OPENAI_API_KEY,
+                    http_client=httpx.AsyncClient(),
+                )
         return self._client
 
     async def classify(

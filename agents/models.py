@@ -151,6 +151,7 @@ class FilterRule(models.Model):
 
     class RuleType(models.TextChoices):
         KEYWORD = "keyword", "Keyword (substring)"
+        PHRASE = "phrase", "Phrase (full text match)"
         EMOJI = "emoji", "Emoji"
         REGEX = "regex", "Regex pattern"
 
