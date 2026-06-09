@@ -26,6 +26,7 @@ from .models import (
     ChatMessage,
     EngineCommand,
     FilterRule,
+    GroupMessage,
     PropagationJob,
     SecurityLog,
     SpamContent,
@@ -405,6 +406,11 @@ def chats_page(request):
         "filter": flt,
         "filters": _DIALOG_FILTERS,
         "counts": counts,
+        # Other active accounts that can act as a helper (admin) for groups
+        # where the monitoring bot lacks admin rights.
+        "helper_bots": bots.filter(status=UserBot.Status.ACTIVE).exclude(pk=bot.pk)
+        if bot
+        else UserBot.objects.none(),
     }
     return render(request, "agents/chats.html", ctx)
 
@@ -454,26 +460,96 @@ def fetch_history(request, bot_id: int, chat_id: int):
 def toggle_antispam(request, dialog_id: int):
     """Enable/disable anti-spam monitoring for a group (takes effect live)."""
     dialog = get_object_or_404(TelegramDialog, pk=dialog_id)
+    flt = request.GET.get("filter", "group")
+    back = f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter={flt}"
     if not dialog.is_group:
         messages.error(request, "Anti-spam can only be enabled on groups.")
-        return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter=group")
+        return redirect(back)
 
     if dialog.monitored:
         TelegramGroup.objects.filter(
             monitored_by=dialog.userbot, chat_id=dialog.chat_id
         ).update(is_active=False)
         dialog.monitored = False
+        dialog.save(update_fields=["monitored"])
         messages.info(request, f"Anti-spam disabled for {dialog.title or dialog.chat_id}.")
-    else:
-        TelegramGroup.objects.update_or_create(
-            monitored_by=dialog.userbot,
-            chat_id=dialog.chat_id,
-            defaults={"title": dialog.title, "is_active": True},
+        return redirect(back)
+
+    # Enabling. If the monitoring bot is not admin, a helper account is needed.
+    helper_bot = None
+    helper_id = request.POST.get("helper_bot")
+    if helper_id:
+        helper_bot = UserBot.objects.filter(pk=helper_id).first()
+
+    if not dialog.is_admin and not helper_bot:
+        messages.error(
+            request,
+            f"'{dialog.title or dialog.chat_id}': this account is not admin here. "
+            "Choose a helper (admin) account to enable anti-spam.",
         )
-        dialog.monitored = True
-        messages.success(request, f"Anti-spam enabled for {dialog.title or dialog.chat_id}.")
+        return redirect(back)
+
+    TelegramGroup.objects.update_or_create(
+        monitored_by=dialog.userbot,
+        chat_id=dialog.chat_id,
+        defaults={
+            "title": dialog.title,
+            "is_active": True,
+            "monitor_is_admin": dialog.is_admin,
+            "helper_bot": helper_bot,
+        },
+    )
+    dialog.monitored = True
     dialog.save(update_fields=["monitored"])
-    return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter={request.GET.get('filter', 'group')}")
+    if dialog.is_admin:
+        messages.success(request, f"Anti-spam enabled for {dialog.title or dialog.chat_id}.")
+    else:
+        messages.success(
+            request,
+            f"Anti-spam enabled for {dialog.title or dialog.chat_id} via helper "
+            f"{helper_bot.username or helper_bot.id}.",
+        )
+    return redirect(back)
+
+
+@login_required
+def group_archive_page(request, bot_id: int, chat_id: int):
+    bot = get_object_or_404(UserBot, pk=bot_id)
+    group = TelegramGroup.objects.filter(monitored_by=bot, chat_id=chat_id).first()
+    return render(
+        request,
+        "agents/group_archive.html",
+        {"active": "chats", "bot": bot, "group": group, "chat_id": chat_id},
+    )
+
+
+@login_required
+def api_group_messages(request, bot_id: int, chat_id: int):
+    role = request.GET.get("role", "")
+    qs = GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id)
+    if role in {"admin", "user", "scam", "bot", "me"}:
+        qs = qs.filter(sender_role=role)
+    rows = qs[:200]
+    data = [
+        {
+            "message_id": m.message_id,
+            "sender_id": m.sender_id,
+            "sender_name": m.sender_name,
+            "sender_username": m.sender_username,
+            "role": m.sender_role,
+            "tg_scam": m.tg_scam_flag,
+            "text": m.text,
+            "media_type": m.media_type,
+            "date": timezone.localtime(m.date).strftime("%Y-%m-%d %H:%M") if m.date else "",
+        }
+        for m in rows
+    ]
+    counts = {
+        "all": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id).count(),
+        "scam": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id, sender_role="scam").count(),
+        "admin": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id, sender_role="admin").count(),
+    }
+    return JsonResponse({"messages": data, "counts": counts})
 
 
 # --------------------------------------------------------------------------- #

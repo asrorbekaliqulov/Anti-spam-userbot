@@ -21,7 +21,6 @@ from django.conf import settings
 from django.utils import timezone as djtz
 
 from pyrogram import Client, filters as pf
-from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.enums import ChatType, ChatMemberStatus, ChatMembersFilter
 from pyrogram.errors import ChatAdminRequired
 from pyrogram.handlers import MessageHandler
@@ -46,6 +45,10 @@ class AgentRunner:
         self._cmd_task: asyncio.Task | None = None
         # bot_id -> (set_of_chat_ids, loaded_at)
         self._monitor_cache: dict[int, tuple[set[int], float]] = {}
+        # bot_id -> own telegram user id (to detect self / own admin rights)
+        self._self_ids: dict[int, int] = {}
+        # chat_id -> (set_of_admin_user_ids, loaded_at)
+        self._admin_cache: dict[int, tuple[set[int], float]] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -109,6 +112,11 @@ class AgentRunner:
         )
         await client.start()
         self.clients[bot["id"]] = client
+        try:
+            me = await client.get_me()
+            self._self_ids[bot["id"]] = me.id
+        except Exception:  # noqa: BLE001
+            self._self_ids[bot["id"]] = bot.get("telegram_id") or 0
         await repo.set_bot_status(bot["id"], "active")
         logger.info("UserBot #%s (%s) started.", bot["id"], bot.get("username"))
 
@@ -119,6 +127,26 @@ class AgentRunner:
 
         text = message.text or message.caption or ""
         content_type, content_hash, photo_path = await self._fingerprint(client, message)
+
+        # Resolve the sender's role (admin / bot / scam / user / me) and archive
+        # the message immediately - we keep EVERY message in a monitored group.
+        role = await self._sender_role(client, message.chat.id, bot_id, sender)
+        await repo.save_group_message(
+            bot_id,
+            message.chat.id,
+            {
+                "message_id": message.id,
+                "sender_id": sender.id,
+                "sender_name": self._display_name(sender),
+                "sender_username": sender.username or "",
+                "sender_role": role,
+                "tg_scam_flag": bool(getattr(sender, "is_scam", False)
+                                     or getattr(sender, "is_fake", False)),
+                "text": text,
+                "media_type": (message.media.value if message.media else ""),
+                "date": self._aware(message.date),
+            },
+        )
 
         try:
             # --- Stages 1 & 2 (cheap, no network) ------------------------- #
@@ -147,6 +175,7 @@ class AgentRunner:
                         userbot_id=bot_id,
                         spammer_id=sender.id,
                         spammer_username=sender.username or "",
+                        message_id=message.id,
                         action="flagged",
                         stage=verdict.stage,
                         detail=verdict.reason,
@@ -156,37 +185,10 @@ class AgentRunner:
             if not verdict.is_spam:
                 return  # clean message
 
-            # --- Confirmed spam: enforce ---------------------------------- #
-            await delete_and_ban(client, message.chat.id, message.id, sender.id)
-            await repo.record_action(
-                chat_id=message.chat.id,
-                userbot_id=bot_id,
-                spammer_id=sender.id,
-                spammer_username=sender.username or "",
-                action="deleted_banned",
-                stage=verdict.stage,
-                detail=verdict.reason,
-            )
+            # --- Confirmed spam ------------------------------------------- #
+            # Mark the archived message's sender as scam.
+            await repo.set_group_message_role(bot_id, message.chat.id, message.id, "scam")
 
-            # Persist learning so future identical spam skips the AI entirely.
-            if verdict.should_cache:
-                await repo.add_to_blacklist(
-                    telegram_id=sender.id,
-                    username=sender.username or "",
-                    first_name=sender.first_name or "",
-                    reason=verdict.reason,
-                )
-                if content_hash:
-                    await repo.cache_spam_content(
-                        content_type=content_type,
-                        content_hash=content_hash,
-                        raw_data=text,
-                    )
-
-            logger.info(
-                "BANNED %s in chat %s [%s] - %s",
-                sender.id, message.chat.id, verdict.stage, verdict.reason,
-            )
             # Enforce - directly if admin, else fallback to helper/saved.
             # _enforce also blacklists the user + caches the content hash.
             await self._enforce(client, message, bot_id, sender, verdict)

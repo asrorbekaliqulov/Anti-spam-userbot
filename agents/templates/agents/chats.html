@@ -68,18 +68,38 @@
           {% if d.last_message %} &middot; {{ d.last_message }}{% endif %}
         </div>
       </div>
-      <div class="text-nowrap d-flex gap-2">
+      <div class="text-nowrap d-flex gap-2 align-items-center">
         <a class="btn btn-sm btn-outline-secondary" href="{% url 'agents:chat_messages' bot.id d.chat_id %}">
           <i class="bi bi-chat-text"></i> Read
         </a>
         {% if d.is_group %}
-        <form method="post" action="{% url 'agents:toggle_antispam' d.id %}?filter={{ filter }}">
-          {% csrf_token %}
-          <button class="btn btn-sm {% if d.monitored %}btn-success{% else %}btn-outline-success{% endif %}">
-            <i class="bi bi-{% if d.monitored %}toggle-on{% else %}toggle-off{% endif %}"></i>
-            anti-spam {% if d.monitored %}ON{% else %}OFF{% endif %}
-          </button>
-        </form>
+          {% if d.monitored %}
+          <a class="btn btn-sm btn-outline-info" href="{% url 'agents:group_archive' bot.id d.chat_id %}">
+            <i class="bi bi-archive"></i> Archive
+          </a>
+          <form method="post" action="{% url 'agents:toggle_antispam' d.id %}?filter={{ filter }}">
+            {% csrf_token %}
+            <button class="btn btn-sm btn-success"><i class="bi bi-toggle-on"></i> anti-spam ON</button>
+          </form>
+          {% elif d.is_admin %}
+          <form method="post" action="{% url 'agents:toggle_antispam' d.id %}?filter={{ filter }}">
+            {% csrf_token %}
+            <button class="btn btn-sm btn-outline-success"><i class="bi bi-toggle-off"></i> enable anti-spam</button>
+          </form>
+          {% else %}
+          <form method="post" action="{% url 'agents:toggle_antispam' d.id %}?filter={{ filter }}" class="d-flex gap-1">
+            {% csrf_token %}
+            <select name="helper_bot" class="form-select form-select-sm" style="width:auto" required title="Not admin here - pick a helper admin account">
+              <option value="">helper account…</option>
+              {% for hb in helper_bots %}
+              <option value="{{ hb.id }}">{{ hb.username|default:hb.phone|default:hb.id }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn btn-sm btn-outline-warning" {% if not helper_bots %}disabled title="No other active account"{% endif %}>
+              <i class="bi bi-shield-plus"></i> enable
+            </button>
+          </form>
+          {% endif %}
         {% endif %}
       </div>
     </div>

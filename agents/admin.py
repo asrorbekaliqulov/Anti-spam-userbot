@@ -5,6 +5,7 @@ from .models import (
     ChatMessage,
     EngineCommand,
     FilterRule,
+    GroupMessage,
     PropagationJob,
     SecurityLog,
     SpamContent,
@@ -100,3 +101,15 @@ class ChatMessageAdmin(admin.ModelAdmin):
 class EngineCommandAdmin(admin.ModelAdmin):
     list_display = ("id", "userbot", "kind", "chat_id", "status", "result", "created_at")
     list_filter = ("kind", "status")
+
+
+
+@admin.register(GroupMessage)
+class GroupMessageAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "userbot", "chat_id", "message_id",
+        "sender_role", "sender_name", "tg_scam_flag", "date",
+    )
+    list_filter = ("sender_role", "tg_scam_flag", "userbot")
+    search_fields = ("text", "sender_name", "sender_username", "sender_id", "chat_id")
+    date_hierarchy = "date"

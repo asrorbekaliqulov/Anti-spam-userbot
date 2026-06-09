@@ -65,6 +65,7 @@ def record_action(
     action: str,
     stage: str,
     detail: str,
+    message_id: int | None = None,
 ) -> None:
     from agents.models import SecurityLog, TelegramGroup
 
@@ -76,6 +77,7 @@ def record_action(
         handled_by_id=userbot_id,
         spammer_id=spammer_id,
         spammer_username=spammer_username or "",
+        message_id=message_id,
         action_taken=action,
         stage=stage,
         detail=detail[:500],
@@ -354,10 +356,9 @@ def is_blacklisted(telegram_id: int) -> bool:
 @sync_to_async
 def count_actions_in_hours(userbot_id: int, hours: int) -> dict:
     """Count enforcement actions in the last N hours for a specific userbot."""
-    import datetime as _dt
     from agents.models import SecurityLog
 
-    since = timezone.now() - _dt.timedelta(hours=hours)
+    since = timezone.now() - __import__("datetime").timedelta(hours=hours)
     qs = SecurityLog.objects.filter(handled_by_id=userbot_id, timestamp__gte=since)
     total = qs.count()
     deleted_banned = qs.filter(action_taken="deleted_banned").count()
