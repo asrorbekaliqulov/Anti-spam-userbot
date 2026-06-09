@@ -348,3 +348,24 @@ def is_blacklisted(telegram_id: int) -> bool:
     from agents.models import BlacklistUser
 
     return BlacklistUser.objects.filter(telegram_id=telegram_id).exists()
+
+
+
+@sync_to_async
+def count_actions_in_hours(userbot_id: int, hours: int) -> dict:
+    """Count enforcement actions in the last N hours for a specific userbot."""
+    import datetime as _dt
+    from agents.models import SecurityLog
+
+    since = timezone.now() - _dt.timedelta(hours=hours)
+    qs = SecurityLog.objects.filter(handled_by_id=userbot_id, timestamp__gte=since)
+    total = qs.count()
+    deleted_banned = qs.filter(action_taken="deleted_banned").count()
+    reported = qs.filter(action_taken="reported").count()
+    flagged = qs.filter(action_taken="flagged").count()
+    return {
+        "total": total,
+        "deleted_banned": deleted_banned,
+        "reported": reported,
+        "flagged": flagged,
+    }
