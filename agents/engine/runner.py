@@ -379,10 +379,42 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _ensure_peer(self, client: Client, chat_id: int) -> bool:
+        """
+        Make sure `chat_id` is resolvable.
+
+        We load sessions from a StringSession (in-memory storage), so the peer
+        cache is empty after an engine restart. When a peer is not cached,
+        Pyrogram falls back to deriving it from the raw id - which fails for the
+        newer, larger channel ids. Iterating get_dialogs() repopulates the cache
+        (with the correct access_hash), after which resolve_peer() succeeds
+        without ever hitting that fragile fallback.
+        """
+        try:
+            await client.resolve_peer(chat_id)
+            return True
+        except (KeyError, ValueError):
+            pass
+        try:
+            async for _ in client.get_dialogs():
+                try:
+                    await client.resolve_peer(chat_id)
+                    return True
+                except (KeyError, ValueError):
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
     async def _fetch_history(
         self, client: Client, bot_id: int, chat_id: int, limit: int
     ) -> int:
         limit = max(1, min(limit or 50, 200))
+        if not await self._ensure_peer(client, chat_id):
+            raise ValueError(
+                f"Could not resolve chat {chat_id}. Run 'Sync chat list' first so "
+                "the account knows this chat."
+            )
         messages: list[dict] = []
         async for m in client.get_chat_history(chat_id, limit=limit):
             sender = m.from_user
