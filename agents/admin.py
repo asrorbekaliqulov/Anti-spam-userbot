@@ -6,9 +6,11 @@ from .models import (
     EngineCommand,
     FilterRule,
     GroupMessage,
+    JoinEvent,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    SpamStrike,
     TelegramDialog,
     TelegramGroup,
     UserBot,
@@ -113,3 +115,25 @@ class GroupMessageAdmin(admin.ModelAdmin):
     list_filter = ("sender_role", "tg_scam_flag", "userbot")
     search_fields = ("text", "sender_name", "sender_username", "sender_id", "chat_id")
     date_hierarchy = "date"
+
+
+
+@admin.register(SpamStrike)
+class SpamStrikeAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "group", "user_id", "username", "first_name",
+        "strike_count", "is_banned", "last_strike_at",
+    )
+    list_filter = ("is_banned", "group")
+    search_fields = ("user_id", "username", "first_name")
+
+
+@admin.register(JoinEvent)
+class JoinEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "group", "user_id", "username", "first_name",
+        "scan_result", "action_taken", "timestamp",
+    )
+    list_filter = ("scan_result", "action_taken", "group")
+    search_fields = ("user_id", "username", "first_name", "detail")
+    date_hierarchy = "timestamp"

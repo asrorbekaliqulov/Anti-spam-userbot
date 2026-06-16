@@ -27,9 +27,11 @@ from .models import (
     EngineCommand,
     FilterRule,
     GroupMessage,
+    JoinEvent,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    SpamStrike,
     TelegramDialog,
     TelegramGroup,
     UserBot,
@@ -47,11 +49,26 @@ def dashboard(request):
         "active_agents": UserBot.objects.filter(status=UserBot.Status.ACTIVE).count(),
         "total_agents": UserBot.objects.count(),
         "blocked_today": SecurityLog.objects.filter(
-            action_taken=SecurityLog.Action.DELETED_AND_BANNED,
+            action_taken__in=[
+                SecurityLog.Action.DELETED_AND_BANNED,
+                SecurityLog.Action.JOIN_BANNED,
+                SecurityLog.Action.STRIKE_BANNED,
+            ],
             timestamp__date=today,
         ).count(),
         "blacklist_size": BlacklistUser.objects.count(),
         "spam_signatures": SpamContent.objects.count(),
+        # New stats
+        "joins_scanned_today": JoinEvent.objects.filter(timestamp__date=today).count(),
+        "joins_banned_today": JoinEvent.objects.filter(
+            timestamp__date=today, action_taken="banned"
+        ).count(),
+        "strikes_today": SecurityLog.objects.filter(
+            action_taken="strike_warn", timestamp__date=today
+        ).count(),
+        "strike_bans_today": SecurityLog.objects.filter(
+            action_taken="strike_ban", timestamp__date=today
+        ).count(),
         "active": "dashboard",
     }
     return render(request, "agents/dashboard.html", ctx)
@@ -589,3 +606,89 @@ def api_messages(request, bot_id: int, chat_id: int):
         for m in rows
     ]
     return JsonResponse({"messages": data})
+
+
+# --------------------------------------------------------------------------- #
+#  Join Events page (new member scan log)
+# --------------------------------------------------------------------------- #
+@login_required
+def join_events_page(request):
+    return render(request, "agents/join_events.html", {"active": "join_events"})
+
+
+@login_required
+def api_join_events(request):
+    """JSON endpoint for join events live table."""
+    rows = JoinEvent.objects.select_related("group", "userbot")[:100]
+    data = [
+        {
+            "timestamp": timezone.localtime(r.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            "group": r.group.title if r.group else "-",
+            "agent": (r.userbot.username or f"bot#{r.userbot_id}") if r.userbot else "-",
+            "user_id": r.user_id,
+            "username": r.username or "-",
+            "first_name": r.first_name or "-",
+            "scan_result": r.get_scan_result_display(),
+            "scan_result_raw": r.scan_result,
+            "action": r.get_action_taken_display(),
+            "action_raw": r.action_taken,
+            "detail": r.detail,
+        }
+        for r in rows
+    ]
+    # Summary stats
+    today = timezone.now().date()
+    today_qs = JoinEvent.objects.filter(timestamp__date=today)
+    stats = {
+        "total_today": today_qs.count(),
+        "banned_today": today_qs.filter(action_taken="banned").count(),
+        "clean_today": today_qs.filter(scan_result="clean").count(),
+        "nsfw_today": today_qs.exclude(scan_result="clean").exclude(
+            scan_result="scan_failed"
+        ).count(),
+    }
+    return JsonResponse({"events": data, "stats": stats})
+
+
+# --------------------------------------------------------------------------- #
+#  Strikes page (3-strike system log)
+# --------------------------------------------------------------------------- #
+@login_required
+def strikes_page(request):
+    return render(request, "agents/strikes.html", {"active": "strikes"})
+
+
+@login_required
+def api_strikes(request):
+    """JSON endpoint for active strikes."""
+    rows = SpamStrike.objects.select_related("group")[:100]
+    data = [
+        {
+            "id": s.id,
+            "group": s.group.title if s.group else "-",
+            "user_id": s.user_id,
+            "username": s.username or "-",
+            "first_name": s.first_name or "-",
+            "strike_count": s.strike_count,
+            "is_banned": s.is_banned,
+            "last_strike_at": timezone.localtime(s.last_strike_at).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
+        for s in rows
+    ]
+    # Stats
+    today = timezone.now().date()
+    stats = {
+        "active_strikes": SpamStrike.objects.filter(
+            is_banned=False, strike_count__gt=0
+        ).count(),
+        "total_banned": SpamStrike.objects.filter(is_banned=True).count(),
+        "warnings_today": SecurityLog.objects.filter(
+            action_taken="strike_warn", timestamp__date=today
+        ).count(),
+        "bans_today": SecurityLog.objects.filter(
+            action_taken="strike_ban", timestamp__date=today
+        ).count(),
+    }
+    return JsonResponse({"strikes": data, "stats": stats})
