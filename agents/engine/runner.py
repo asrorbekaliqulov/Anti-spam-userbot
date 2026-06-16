@@ -52,6 +52,17 @@ _AD_SPAM_KEYWORDS = [
     "free telegram premium", "bepul premium", "premium sovg'a",
     "premium gift", "получи premium", "olish uchun",
     "bosing va oling", "click and get", "нажми и получи",
+    # Uzbek phishing patterns
+    "tekin premium", "bepul telegram", "telegram premium",
+    "premium olish", "premium beradi", "premium taqdim",
+    "aksiya premium", "sovg'a premium", "premium hadya",
+    "premium bepul", "pullik kanallar", "tekin obuna",
+    # Russian phishing patterns
+    "бесплатный премиум", "получить премиум", "премиум бесплатно",
+    "акция премиум", "подарок премиум", "раздача премиум",
+    # English phishing patterns
+    "get premium free", "free premium link", "premium giveaway",
+    "claim your premium", "premium for free", "win premium",
 ]
 
 
@@ -118,12 +129,34 @@ class AgentRunner:
             except Exception as exc:  # noqa: BLE001 - never kill the listener
                 logger.exception("handler error: %s", exc)
 
-        # Only react to group/supergroup messages from real users.
+        # React to ALL group/supergroup messages (non-service) from real users.
         client.add_handler(
             MessageHandler(handler, pf.group & ~pf.service & ~pf.me)
         )
 
-        # --- New member join handler (ChatMemberUpdated) ------------------- #
+        # --- Service message handler for new_chat_members (small groups) --- #
+        async def service_handler(client: Client, message, _bot_id=bot["id"]):
+            try:
+                if not message.chat:
+                    return
+                if not await self._is_monitored(_bot_id, message.chat.id):
+                    return
+                await self._on_service_join(client, message, _bot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("service handler error: %s", exc)
+
+        # Catch new_chat_members service messages.
+        # Use a custom filter function to safely detect join service messages
+        # regardless of Pyrogram version nuances.
+        def _is_join_service(_, __, message):
+            return bool(getattr(message, "new_chat_members", None))
+
+        join_service_filter = pf.create(_is_join_service)
+        client.add_handler(
+            MessageHandler(service_handler, pf.group & join_service_filter)
+        )
+
+        # --- ChatMemberUpdated handler for new joins (large groups) -------- #
         async def join_handler(client: Client, update, _bot_id=bot["id"]):
             try:
                 await self._on_member_join(client, update, _bot_id)
@@ -154,6 +187,73 @@ class AgentRunner:
             self._self_ids[bot["id"]] = bot.get("telegram_id") or 0
         await repo.set_bot_status(bot["id"], "active")
         logger.info("UserBot #%s (%s) started.", bot["id"], bot.get("username"))
+
+    async def _on_service_join(self, client: Client, message, bot_id: int) -> None:
+        """
+        Handle new_chat_members service messages (fires in smaller groups).
+
+        In groups with fewer than ~10,000 members, Telegram sends a service
+        message with new_chat_members rather than a ChatMemberUpdated event.
+        We process each new member through the same profile scan pipeline.
+        """
+        if not message.new_chat_members:
+            return
+
+        chat_id = message.chat.id
+        for user in message.new_chat_members:
+            if not user:
+                continue
+            if user.is_bot:
+                continue
+            if user.id == self._self_ids.get(bot_id):
+                continue
+
+            logger.info(
+                "New member (service msg): %s (%s) in chat %s",
+                user.id, user.username or user.first_name, chat_id,
+            )
+
+            # Check if already blacklisted
+            if await repo.is_blacklisted(user.id):
+                await self._ban_new_member(
+                    client, chat_id, bot_id, user,
+                    scan_result="nsfw_photo",
+                    detail="User already on blacklist",
+                )
+                continue
+
+            # Run full profile scan
+            profile_scanner = get_scanner()
+            scan_result, detail = await profile_scanner.full_scan(client, user.id)
+
+            if scan_result == "clean":
+                await repo.record_join_event(
+                    chat_id=chat_id,
+                    userbot_id=bot_id,
+                    user_id=user.id,
+                    username=user.username or "",
+                    first_name=user.first_name or "",
+                    bio="",
+                    scan_result="clean",
+                    action_taken="allowed",
+                    detail=detail,
+                )
+                await repo.record_action(
+                    chat_id=chat_id,
+                    userbot_id=bot_id,
+                    spammer_id=user.id,
+                    spammer_username=user.username or "",
+                    action="join_allowed",
+                    stage="profile_scan",
+                    detail=f"Clean profile: {detail}",
+                )
+                logger.info("Join ALLOWED: %s in chat %s (clean)", user.id, chat_id)
+            else:
+                await self._ban_new_member(
+                    client, chat_id, bot_id, user,
+                    scan_result=scan_result,
+                    detail=detail,
+                )
 
     async def _on_member_join(self, client: Client, update, bot_id: int) -> None:
         """
