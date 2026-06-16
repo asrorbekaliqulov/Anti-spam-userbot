@@ -11,6 +11,7 @@ picked up the next time the worker is (re)started.
 """
 import asyncio
 import signal
+import sys
 
 from django.core.management.base import BaseCommand
 
@@ -20,12 +21,37 @@ from agents.engine.runner import AgentRunner
 class Command(BaseCommand):
     help = "Start all active userbots and begin monitoring their groups."
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--clear-cache",
+            action="store_true",
+            default=False,
+            help="Clear __pycache__ directories before starting (fixes stale .pyc issues)",
+        )
+
     def handle(self, *args, **options):
+        if options["clear_cache"]:
+            self._clear_pycache()
+
         self.stdout.write(self.style.SUCCESS("Starting anti-spam engine..."))
         try:
             asyncio.run(self._main())
         except KeyboardInterrupt:
             self.stdout.write(self.style.WARNING("Stopped by operator."))
+
+    def _clear_pycache(self):
+        """Remove all __pycache__ dirs to ensure fresh imports."""
+        import shutil
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent.parent.parent.parent
+        count = 0
+        for cache_dir in base.rglob("__pycache__"):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            count += 1
+        self.stdout.write(
+            self.style.WARNING(f"Cleared {count} __pycache__ directories.")
+        )
 
     async def _main(self):
         runner = AgentRunner()
