@@ -57,6 +57,18 @@ class TelegramGroup(models.Model):
         on_delete=models.CASCADE,
         related_name="groups",
     )
+    # Whether the monitoring userbot itself has admin rights in this group.
+    monitor_is_admin = models.BooleanField(default=False)
+    # Optional secondary account used when the monitoring bot is NOT admin:
+    # it receives the spam message_id + spammer id (and can enforce if it is
+    # admin and running in the engine).
+    helper_bot = models.ForeignKey(
+        UserBot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="helper_for_groups",
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -208,6 +220,13 @@ class SecurityLog(models.Model):
         BANNED = "banned", "User banned"
         DELETED_AND_BANNED = "deleted_banned", "Deleted + Banned"
         FLAGGED = "flagged", "Flagged (AI)"
+        REPORTED = "reported", "Reported to helper account"
+        # New member join scanning
+        JOIN_BANNED = "join_banned", "Banned on join (NSFW profile)"
+        JOIN_ALLOWED = "join_allowed", "Allowed on join (clean)"
+        # 3-strike system
+        STRIKE_WARNING = "strike_warn", "Strike warning (msg deleted)"
+        STRIKE_BANNED = "strike_ban", "Banned after 3 strikes"
 
     group = models.ForeignKey(
         TelegramGroup,
@@ -225,6 +244,7 @@ class SecurityLog(models.Model):
     )
     spammer_id = models.BigIntegerField(null=True, blank=True)
     spammer_username = models.CharField(max_length=64, blank=True, default="")
+    message_id = models.BigIntegerField(null=True, blank=True)
     action_taken = models.CharField(max_length=24, choices=Action.choices)
     # Which pipeline stage triggered the action (blacklist / regex / ai).
     stage = models.CharField(max_length=32, blank=True, default="")
@@ -350,3 +370,147 @@ class EngineCommand(models.Model):
 
     def __str__(self) -> str:
         return f"{self.kind} bot#{self.userbot_id} ({self.status})"
+
+
+
+class SpamStrike(models.Model):
+    """
+    Tracks spam strikes per user per group.
+
+    The 3-strike system:
+      - Strike 1 & 2: delete the spam message only (user might be hacked)
+      - Strike 3: ban the user and remove from the group
+
+    Strikes reset if a user hasn't sent spam for 24 hours (configurable).
+    """
+
+    group = models.ForeignKey(
+        TelegramGroup,
+        on_delete=models.CASCADE,
+        related_name="strikes",
+    )
+    user_id = models.BigIntegerField(db_index=True)
+    username = models.CharField(max_length=64, blank=True, default="")
+    first_name = models.CharField(max_length=128, blank=True, default="")
+    strike_count = models.PositiveIntegerField(default=0)
+    last_strike_at = models.DateTimeField(default=timezone.now)
+    # Once banned, no more tracking needed.
+    is_banned = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-last_strike_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["group", "user_id"],
+                name="unique_strike_per_user_per_group",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.username or self.user_id} - {self.strike_count} strikes"
+
+
+class JoinEvent(models.Model):
+    """
+    Log of every new member join in a monitored group.
+
+    Records the scan results: whether profile photos or linked channel
+    contained 18+ / NSFW content, and the action taken.
+    """
+
+    class ScanResult(models.TextChoices):
+        CLEAN = "clean", "Clean"
+        NSFW_PHOTO = "nsfw_photo", "NSFW profile photo"
+        NSFW_CHANNEL = "nsfw_channel", "NSFW linked channel"
+        NSFW_BOTH = "nsfw_both", "NSFW photo + channel"
+        SCAN_FAILED = "scan_failed", "Scan failed"
+
+    class ActionTaken(models.TextChoices):
+        ALLOWED = "allowed", "Allowed"
+        BANNED = "banned", "Banned + Removed"
+        MONITORING = "monitoring", "Under monitoring"
+
+    group = models.ForeignKey(
+        TelegramGroup,
+        on_delete=models.CASCADE,
+        related_name="join_events",
+    )
+    userbot = models.ForeignKey(
+        UserBot,
+        on_delete=models.CASCADE,
+        related_name="join_events",
+    )
+    user_id = models.BigIntegerField(db_index=True)
+    username = models.CharField(max_length=64, blank=True, default="")
+    first_name = models.CharField(max_length=128, blank=True, default="")
+    bio = models.TextField(blank=True, default="")
+
+    scan_result = models.CharField(
+        max_length=16, choices=ScanResult.choices, default=ScanResult.CLEAN
+    )
+    action_taken = models.CharField(
+        max_length=16, choices=ActionTaken.choices, default=ActionTaken.ALLOWED
+    )
+    detail = models.TextField(blank=True, default="")
+    timestamp = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ["-timestamp"]
+
+    def __str__(self) -> str:
+        return f"Join: {self.username or self.user_id} -> {self.scan_result} ({self.action_taken})"
+
+
+class GroupMessage(models.Model):
+    """
+    Persistent archive of EVERY message seen in a monitored group.
+
+    Unlike `ChatMessage` (an on-demand cache that gets replaced), this is an
+    append-only log written live by the engine for groups where anti-spam is
+    enabled. Each row is enriched with the sender's role so the dashboard can
+    show who wrote what (admin / user / scam / bot / me) instead of raw ids.
+    """
+
+    class SenderRole(models.TextChoices):
+        ME = "me", "Me (this account)"
+        ADMIN = "admin", "Group admin"
+        BOT = "bot", "Bot"
+        SCAM = "scam", "Scam / spam"
+        USER = "user", "Regular user"
+
+    group = models.ForeignKey(
+        TelegramGroup, on_delete=models.CASCADE, related_name="messages"
+    )
+    userbot = models.ForeignKey(
+        UserBot, on_delete=models.CASCADE, related_name="archived_messages"
+    )
+    chat_id = models.BigIntegerField(db_index=True)
+    message_id = models.BigIntegerField()
+
+    sender_id = models.BigIntegerField(null=True, blank=True, db_index=True)
+    sender_name = models.CharField(max_length=128, blank=True, default="")
+    sender_username = models.CharField(max_length=64, blank=True, default="")
+    sender_role = models.CharField(
+        max_length=8, choices=SenderRole.choices, default=SenderRole.USER
+    )
+    # Telegram's own scam/fake account flags, kept for transparency.
+    tg_scam_flag = models.BooleanField(default=False)
+
+    text = models.TextField(blank=True, default="")
+    media_type = models.CharField(max_length=24, blank=True, default="")
+    date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-message_id"]
+        indexes = [models.Index(fields=["chat_id", "message_id"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["userbot", "chat_id", "message_id"],
+                name="unique_archived_group_message",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.sender_role}] {self.sender_name}: {self.text[:30]}"

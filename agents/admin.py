@@ -5,9 +5,12 @@ from .models import (
     ChatMessage,
     EngineCommand,
     FilterRule,
+    GroupMessage,
+    JoinEvent,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    SpamStrike,
     TelegramDialog,
     TelegramGroup,
     UserBot,
@@ -100,3 +103,37 @@ class ChatMessageAdmin(admin.ModelAdmin):
 class EngineCommandAdmin(admin.ModelAdmin):
     list_display = ("id", "userbot", "kind", "chat_id", "status", "result", "created_at")
     list_filter = ("kind", "status")
+
+
+
+@admin.register(GroupMessage)
+class GroupMessageAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "userbot", "chat_id", "message_id",
+        "sender_role", "sender_name", "tg_scam_flag", "date",
+    )
+    list_filter = ("sender_role", "tg_scam_flag", "userbot")
+    search_fields = ("text", "sender_name", "sender_username", "sender_id", "chat_id")
+    date_hierarchy = "date"
+
+
+
+@admin.register(SpamStrike)
+class SpamStrikeAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "group", "user_id", "username", "first_name",
+        "strike_count", "is_banned", "last_strike_at",
+    )
+    list_filter = ("is_banned", "group")
+    search_fields = ("user_id", "username", "first_name")
+
+
+@admin.register(JoinEvent)
+class JoinEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "group", "user_id", "username", "first_name",
+        "scan_result", "action_taken", "timestamp",
+    )
+    list_filter = ("scan_result", "action_taken", "group")
+    search_fields = ("user_id", "username", "first_name", "detail")
+    date_hierarchy = "timestamp"

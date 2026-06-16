@@ -1,0 +1,96 @@
+{% extends "agents/base.html" %}
+{% block title %}Archive - {{ group.title|default:chat_id }}{% endblock %}
+{% block heading %}
+  <a href="{% url 'agents:chats' %}?bot={{ bot.id }}&filter=group" class="text-secondary text-decoration-none"><i class="bi bi-arrow-left"></i></a>
+  Live archive: {{ group.title|default:chat_id }}
+{% endblock %}
+{% block content %}
+
+<div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+  <div class="text-secondary small">
+    {% if group %}
+      chat {{ chat_id }}
+      {% if group.monitor_is_admin %}<span class="badge text-bg-primary ms-1">bot is admin</span>
+      {% elif group.helper_bot %}<span class="badge text-bg-warning ms-1">helper: {{ group.helper_bot.username|default:group.helper_bot.id }}</span>{% endif %}
+      <span class="badge text-bg-success ms-1"><i class="bi bi-shield-check"></i> anti-spam</span>
+    {% else %}
+      <span class="text-warning">This group is not currently monitored.</span>
+    {% endif %}
+  </div>
+  <div class="btn-group btn-group-sm" role="group" id="roleFilter">
+    <button class="btn btn-outline-secondary active" data-role="">All <span class="badge text-bg-dark" id="cAll">0</span></button>
+    <button class="btn btn-outline-danger" data-role="scam">Scam <span class="badge text-bg-dark" id="cScam">0</span></button>
+    <button class="btn btn-outline-primary" data-role="admin">Admins</button>
+    <button class="btn btn-outline-light" data-role="user">Users</button>
+    <button class="btn btn-outline-warning" data-role="bot">Bots</button>
+  </div>
+</div>
+
+<div class="card p-0">
+  <div class="table-responsive" style="max-height:68vh;overflow:auto;">
+    <table class="table table-sm table-hover align-middle text-light mb-0">
+      <thead class="text-secondary position-sticky top-0" style="background:#161a22;">
+        <tr><th>Time</th><th>Role</th><th>Sender</th><th>Message</th><th>msg id</th></tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="5" class="text-center text-secondary py-4">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="form-text mt-2">
+  <i class="bi bi-info-circle"></i> Every message in this group is archived live by the engine.
+  Senders are labelled by role; scam senders are detected by the hybrid filter (DB / regex / AI).
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const botId = {{ bot.id }};
+const chatId = {{ chat_id }};
+let role = "";
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+function roleBadge(r, scam){
+  const map = {scam:'danger', admin:'primary', bot:'warning', me:'info', user:'secondary'};
+  let html = `<span class="badge text-bg-${map[r]||'secondary'}">${r}</span>`;
+  if(scam && r !== 'scam') html += ' <span class="badge text-bg-danger" title="Telegram scam/fake flag">tg-scam</span>';
+  return html;
+}
+
+async function load(){
+  const res = await fetch(`/api/group-messages/${botId}/${chatId}/` + (role ? `?role=${role}` : ''));
+  const data = await res.json();
+  document.getElementById('cAll').textContent = data.counts.all;
+  document.getElementById('cScam').textContent = data.counts.scam;
+  const body = document.getElementById('rows');
+  if(!data.messages.length){
+    body.innerHTML = '<tr><td colspan="5" class="text-center text-secondary py-4">No archived messages yet (engine must be running and the group monitored).</td></tr>';
+    return;
+  }
+  body.innerHTML = data.messages.map(m => {
+    const uname = m.sender_username ? ` <span class="text-secondary">@${esc(m.sender_username)}</span>` : '';
+    const media = m.media_type ? `<span class="badge text-bg-secondary ms-1">${m.media_type}</span>` : '';
+    return `<tr class="${m.role==='scam'?'table-danger':''}">
+      <td class="small text-nowrap text-secondary">${m.date}</td>
+      <td>${roleBadge(m.role, m.tg_scam)}</td>
+      <td class="text-nowrap">${esc(m.sender_name)}${uname}<div class="small text-secondary">id: ${m.sender_id||'—'}</div></td>
+      <td>${esc(m.text) || '<span class="text-muted">[no text]</span>'} ${media}</td>
+      <td class="small text-secondary">${m.message_id}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.querySelectorAll('#roleFilter button').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('#roleFilter button').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    role = b.dataset.role;
+    load();
+  });
+});
+
+load();
+setInterval(load, 4000);
+</script>
+{% endblock %}

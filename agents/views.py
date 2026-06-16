@@ -26,9 +26,12 @@ from .models import (
     ChatMessage,
     EngineCommand,
     FilterRule,
+    GroupMessage,
+    JoinEvent,
     PropagationJob,
     SecurityLog,
     SpamContent,
+    SpamStrike,
     TelegramDialog,
     TelegramGroup,
     UserBot,
@@ -46,11 +49,26 @@ def dashboard(request):
         "active_agents": UserBot.objects.filter(status=UserBot.Status.ACTIVE).count(),
         "total_agents": UserBot.objects.count(),
         "blocked_today": SecurityLog.objects.filter(
-            action_taken=SecurityLog.Action.DELETED_AND_BANNED,
+            action_taken__in=[
+                SecurityLog.Action.DELETED_AND_BANNED,
+                SecurityLog.Action.JOIN_BANNED,
+                SecurityLog.Action.STRIKE_BANNED,
+            ],
             timestamp__date=today,
         ).count(),
         "blacklist_size": BlacklistUser.objects.count(),
         "spam_signatures": SpamContent.objects.count(),
+        # New stats
+        "joins_scanned_today": JoinEvent.objects.filter(timestamp__date=today).count(),
+        "joins_banned_today": JoinEvent.objects.filter(
+            timestamp__date=today, action_taken="banned"
+        ).count(),
+        "strikes_today": SecurityLog.objects.filter(
+            action_taken="strike_warn", timestamp__date=today
+        ).count(),
+        "strike_bans_today": SecurityLog.objects.filter(
+            action_taken="strike_ban", timestamp__date=today
+        ).count(),
         "active": "dashboard",
     }
     return render(request, "agents/dashboard.html", ctx)
@@ -405,6 +423,11 @@ def chats_page(request):
         "filter": flt,
         "filters": _DIALOG_FILTERS,
         "counts": counts,
+        # Other active accounts that can act as a helper (admin) for groups
+        # where the monitoring bot lacks admin rights.
+        "helper_bots": bots.filter(status=UserBot.Status.ACTIVE).exclude(pk=bot.pk)
+        if bot
+        else UserBot.objects.none(),
     }
     return render(request, "agents/chats.html", ctx)
 
@@ -454,26 +477,96 @@ def fetch_history(request, bot_id: int, chat_id: int):
 def toggle_antispam(request, dialog_id: int):
     """Enable/disable anti-spam monitoring for a group (takes effect live)."""
     dialog = get_object_or_404(TelegramDialog, pk=dialog_id)
+    flt = request.GET.get("filter", "group")
+    back = f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter={flt}"
     if not dialog.is_group:
         messages.error(request, "Anti-spam can only be enabled on groups.")
-        return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter=group")
+        return redirect(back)
 
     if dialog.monitored:
         TelegramGroup.objects.filter(
             monitored_by=dialog.userbot, chat_id=dialog.chat_id
         ).update(is_active=False)
         dialog.monitored = False
+        dialog.save(update_fields=["monitored"])
         messages.info(request, f"Anti-spam disabled for {dialog.title or dialog.chat_id}.")
-    else:
-        TelegramGroup.objects.update_or_create(
-            monitored_by=dialog.userbot,
-            chat_id=dialog.chat_id,
-            defaults={"title": dialog.title, "is_active": True},
+        return redirect(back)
+
+    # Enabling. If the monitoring bot is not admin, a helper account is needed.
+    helper_bot = None
+    helper_id = request.POST.get("helper_bot")
+    if helper_id:
+        helper_bot = UserBot.objects.filter(pk=helper_id).first()
+
+    if not dialog.is_admin and not helper_bot:
+        messages.error(
+            request,
+            f"'{dialog.title or dialog.chat_id}': this account is not admin here. "
+            "Choose a helper (admin) account to enable anti-spam.",
         )
-        dialog.monitored = True
-        messages.success(request, f"Anti-spam enabled for {dialog.title or dialog.chat_id}.")
+        return redirect(back)
+
+    TelegramGroup.objects.update_or_create(
+        monitored_by=dialog.userbot,
+        chat_id=dialog.chat_id,
+        defaults={
+            "title": dialog.title,
+            "is_active": True,
+            "monitor_is_admin": dialog.is_admin,
+            "helper_bot": helper_bot,
+        },
+    )
+    dialog.monitored = True
     dialog.save(update_fields=["monitored"])
-    return redirect(f"{reverse('agents:chats')}?bot={dialog.userbot_id}&filter={request.GET.get('filter', 'group')}")
+    if dialog.is_admin:
+        messages.success(request, f"Anti-spam enabled for {dialog.title or dialog.chat_id}.")
+    else:
+        messages.success(
+            request,
+            f"Anti-spam enabled for {dialog.title or dialog.chat_id} via helper "
+            f"{helper_bot.username or helper_bot.id}.",
+        )
+    return redirect(back)
+
+
+@login_required
+def group_archive_page(request, bot_id: int, chat_id: int):
+    bot = get_object_or_404(UserBot, pk=bot_id)
+    group = TelegramGroup.objects.filter(monitored_by=bot, chat_id=chat_id).first()
+    return render(
+        request,
+        "agents/group_archive.html",
+        {"active": "chats", "bot": bot, "group": group, "chat_id": chat_id},
+    )
+
+
+@login_required
+def api_group_messages(request, bot_id: int, chat_id: int):
+    role = request.GET.get("role", "")
+    qs = GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id)
+    if role in {"admin", "user", "scam", "bot", "me"}:
+        qs = qs.filter(sender_role=role)
+    rows = qs[:200]
+    data = [
+        {
+            "message_id": m.message_id,
+            "sender_id": m.sender_id,
+            "sender_name": m.sender_name,
+            "sender_username": m.sender_username,
+            "role": m.sender_role,
+            "tg_scam": m.tg_scam_flag,
+            "text": m.text,
+            "media_type": m.media_type,
+            "date": timezone.localtime(m.date).strftime("%Y-%m-%d %H:%M") if m.date else "",
+        }
+        for m in rows
+    ]
+    counts = {
+        "all": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id).count(),
+        "scam": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id, sender_role="scam").count(),
+        "admin": GroupMessage.objects.filter(userbot_id=bot_id, chat_id=chat_id, sender_role="admin").count(),
+    }
+    return JsonResponse({"messages": data, "counts": counts})
 
 
 # --------------------------------------------------------------------------- #
@@ -513,3 +606,89 @@ def api_messages(request, bot_id: int, chat_id: int):
         for m in rows
     ]
     return JsonResponse({"messages": data})
+
+
+# --------------------------------------------------------------------------- #
+#  Join Events page (new member scan log)
+# --------------------------------------------------------------------------- #
+@login_required
+def join_events_page(request):
+    return render(request, "agents/join_events.html", {"active": "join_events"})
+
+
+@login_required
+def api_join_events(request):
+    """JSON endpoint for join events live table."""
+    rows = JoinEvent.objects.select_related("group", "userbot")[:100]
+    data = [
+        {
+            "timestamp": timezone.localtime(r.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            "group": r.group.title if r.group else "-",
+            "agent": (r.userbot.username or f"bot#{r.userbot_id}") if r.userbot else "-",
+            "user_id": r.user_id,
+            "username": r.username or "-",
+            "first_name": r.first_name or "-",
+            "scan_result": r.get_scan_result_display(),
+            "scan_result_raw": r.scan_result,
+            "action": r.get_action_taken_display(),
+            "action_raw": r.action_taken,
+            "detail": r.detail,
+        }
+        for r in rows
+    ]
+    # Summary stats
+    today = timezone.now().date()
+    today_qs = JoinEvent.objects.filter(timestamp__date=today)
+    stats = {
+        "total_today": today_qs.count(),
+        "banned_today": today_qs.filter(action_taken="banned").count(),
+        "clean_today": today_qs.filter(scan_result="clean").count(),
+        "nsfw_today": today_qs.exclude(scan_result="clean").exclude(
+            scan_result="scan_failed"
+        ).count(),
+    }
+    return JsonResponse({"events": data, "stats": stats})
+
+
+# --------------------------------------------------------------------------- #
+#  Strikes page (3-strike system log)
+# --------------------------------------------------------------------------- #
+@login_required
+def strikes_page(request):
+    return render(request, "agents/strikes.html", {"active": "strikes"})
+
+
+@login_required
+def api_strikes(request):
+    """JSON endpoint for active strikes."""
+    rows = SpamStrike.objects.select_related("group")[:100]
+    data = [
+        {
+            "id": s.id,
+            "group": s.group.title if s.group else "-",
+            "user_id": s.user_id,
+            "username": s.username or "-",
+            "first_name": s.first_name or "-",
+            "strike_count": s.strike_count,
+            "is_banned": s.is_banned,
+            "last_strike_at": timezone.localtime(s.last_strike_at).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
+        for s in rows
+    ]
+    # Stats
+    today = timezone.now().date()
+    stats = {
+        "active_strikes": SpamStrike.objects.filter(
+            is_banned=False, strike_count__gt=0
+        ).count(),
+        "total_banned": SpamStrike.objects.filter(is_banned=True).count(),
+        "warnings_today": SecurityLog.objects.filter(
+            action_taken="strike_warn", timestamp__date=today
+        ).count(),
+        "bans_today": SecurityLog.objects.filter(
+            action_taken="strike_ban", timestamp__date=today
+        ).count(),
+    }
+    return JsonResponse({"strikes": data, "stats": stats})

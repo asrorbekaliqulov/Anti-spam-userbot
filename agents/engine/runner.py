@@ -8,6 +8,14 @@ is deleted, the sender banned, and (for AI-confirmed novel spam) the payload is
 fingerprinted into `SpamContent` and the user added to `BlacklistUser` so the
 next occurrence is blocked instantly without an AI call.
 
+Additionally handles:
+  - New member joins: scans profile photos and linked channels for 18+ content.
+    NSFW profiles are immediately banned and removed.
+  - 3-Strike system for "advertising" spam: messages that look like scam ads
+    (free premium, phishing links) are deleted but the sender is NOT immediately
+    banned (their account may be hacked). After 3 strikes in 24h, the user is
+    banned and removed.
+
 All clients share the one background event loop and run concurrently.
 """
 from __future__ import annotations
@@ -21,14 +29,14 @@ from django.conf import settings
 from django.utils import timezone as djtz
 
 from pyrogram import Client, filters as pf
-from pyrogram.enums import ChatType, ChatMemberStatus
 from pyrogram.enums import ChatType, ChatMemberStatus, ChatMembersFilter
 from pyrogram.errors import ChatAdminRequired
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import ChatMemberUpdatedHandler, MessageHandler
 
 from . import repository as repo
 from .filters import ai_decide, precheck
 from .hashing import image_phash, text_hash
+from .profile_scanner import scanner as get_scanner
 from .propagation import delete_and_ban, propagate_agent, safe_call, throttle
 
 logger = logging.getLogger(__name__)
@@ -36,6 +44,23 @@ logger = logging.getLogger(__name__)
 # How long the engine caches each bot's monitored-chat set (seconds). A short
 # TTL lets dashboard anti-spam toggles take effect without restarting the engine.
 _MONITOR_TTL = 12.0
+
+# Keywords that indicate "scam advertising" (free premium, etc.) - these trigger
+# the 3-strike system instead of immediate ban.
+_AD_SPAM_KEYWORDS = [
+    "tekin telegram premium", "бесплатный telegram premium",
+    "free telegram premium", "bepul premium", "premium sovg'a",
+    "premium gift", "получи premium", "olish uchun",
+    "bosing va oling", "click and get", "нажми и получи",
+]
+
+
+def _is_ad_spam(text: str) -> bool:
+    """Check if the message looks like advertising spam (not hardcore scam bot)."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _AD_SPAM_KEYWORDS)
 
 
 class AgentRunner:
@@ -46,6 +71,10 @@ class AgentRunner:
         self._cmd_task: asyncio.Task | None = None
         # bot_id -> (set_of_chat_ids, loaded_at)
         self._monitor_cache: dict[int, tuple[set[int], float]] = {}
+        # bot_id -> own telegram user id (to detect self / own admin rights)
+        self._self_ids: dict[int, int] = {}
+        # chat_id -> (set_of_admin_user_ids, loaded_at)
+        self._admin_cache: dict[int, tuple[set[int], float]] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -94,6 +123,15 @@ class AgentRunner:
             MessageHandler(handler, pf.group & ~pf.service & ~pf.me)
         )
 
+        # --- New member join handler (ChatMemberUpdated) ------------------- #
+        async def join_handler(client: Client, update, _bot_id=bot["id"]):
+            try:
+                await self._on_member_join(client, update, _bot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("join handler error: %s", exc)
+
+        client.add_handler(ChatMemberUpdatedHandler(join_handler))
+
         # /count N command in private chat or Saved Messages.
         async def count_handler(client: Client, message, _bot_id=bot["id"]):
             try:
@@ -109,8 +147,175 @@ class AgentRunner:
         )
         await client.start()
         self.clients[bot["id"]] = client
+        try:
+            me = await client.get_me()
+            self._self_ids[bot["id"]] = me.id
+        except Exception:  # noqa: BLE001
+            self._self_ids[bot["id"]] = bot.get("telegram_id") or 0
         await repo.set_bot_status(bot["id"], "active")
         logger.info("UserBot #%s (%s) started.", bot["id"], bot.get("username"))
+
+    async def _on_member_join(self, client: Client, update, bot_id: int) -> None:
+        """
+        Handle ChatMemberUpdated events - detect new members joining monitored groups.
+
+        Scans the new member's profile for NSFW content:
+          - Profile photos checked for 18+ imagery
+          - Bio checked for linked channels with adult content
+
+        If NSFW content is found: immediately ban and remove the user.
+        """
+        # Only process join events (new_chat_member status change)
+        if not update.chat:
+            return
+        chat_id = update.chat.id
+
+        # Must be a monitored group
+        if not await self._is_monitored(bot_id, chat_id):
+            return
+
+        # Check if this is a "join" event
+        new_member = update.new_chat_member
+        old_member = update.old_chat_member
+
+        if not new_member or not new_member.user:
+            return
+
+        user = new_member.user
+
+        # Skip bots, self, and admins
+        if user.is_bot:
+            return
+        if user.id == self._self_ids.get(bot_id):
+            return
+
+        # Determine if this is actually a NEW join (was not a member before)
+        is_new_join = False
+        new_status = new_member.status
+        if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
+            if old_member is None:
+                is_new_join = True
+            elif old_member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.BANNED,
+            ):
+                is_new_join = True
+
+        if not is_new_join:
+            return
+
+        logger.info(
+            "New member join: %s (%s) in chat %s",
+            user.id, user.username or user.first_name, chat_id,
+        )
+
+        # Check if already blacklisted - immediate ban
+        if await repo.is_blacklisted(user.id):
+            await self._ban_new_member(
+                client, chat_id, bot_id, user,
+                scan_result="nsfw_photo",
+                detail="User already on blacklist",
+            )
+            return
+
+        # Run full profile scan
+        profile_scanner = get_scanner()
+        scan_result, detail = await profile_scanner.full_scan(client, user.id)
+
+        if scan_result == "clean":
+            # User is clean - log and allow
+            await repo.record_join_event(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                user_id=user.id,
+                username=user.username or "",
+                first_name=user.first_name or "",
+                bio="",
+                scan_result="clean",
+                action_taken="allowed",
+                detail=detail,
+            )
+            await repo.record_action(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                spammer_id=user.id,
+                spammer_username=user.username or "",
+                action="join_allowed",
+                stage="profile_scan",
+                detail=f"Clean profile: {detail}",
+            )
+            logger.info("Join ALLOWED: %s in chat %s (clean)", user.id, chat_id)
+        else:
+            # NSFW detected - ban and remove
+            await self._ban_new_member(
+                client, chat_id, bot_id, user,
+                scan_result=scan_result,
+                detail=detail,
+            )
+
+    async def _ban_new_member(
+        self, client: Client, chat_id: int, bot_id: int, user,
+        scan_result: str, detail: str,
+    ) -> None:
+        """Ban a newly joined member who failed the profile scan."""
+        username = user.username or ""
+        first_name = user.first_name or ""
+
+        # Record join event
+        await repo.record_join_event(
+            chat_id=chat_id,
+            userbot_id=bot_id,
+            user_id=user.id,
+            username=username,
+            first_name=first_name,
+            bio="",
+            scan_result=scan_result,
+            action_taken="banned",
+            detail=detail,
+        )
+
+        # Add to blacklist
+        await repo.add_to_blacklist(
+            telegram_id=user.id,
+            username=username,
+            first_name=first_name,
+            reason=f"NSFW profile on join: {scan_result}",
+        )
+
+        # Try to ban
+        try:
+            await safe_call(
+                lambda: client.ban_chat_member(chat_id, user.id),
+                what="ban_nsfw_joiner",
+            )
+            await repo.record_action(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                spammer_id=user.id,
+                spammer_username=username,
+                action="join_banned",
+                stage="profile_scan",
+                detail=f"NSFW join ban ({scan_result}): {detail}",
+            )
+            logger.info(
+                "Join BANNED: %s in chat %s (%s)", user.id, chat_id, scan_result
+            )
+        except ChatAdminRequired:
+            # Not admin - report
+            await repo.record_action(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                spammer_id=user.id,
+                spammer_username=username,
+                action="reported",
+                stage="profile_scan",
+                detail=f"NSFW join detected but not admin ({scan_result}): {detail}",
+            )
+            logger.warning(
+                "Join NSFW detected but not admin: %s in chat %s", user.id, chat_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to ban NSFW joiner %s: %s", user.id, exc)
 
     async def _on_message(self, client: Client, message, bot_id: int) -> None:
         sender = message.from_user
@@ -119,6 +324,30 @@ class AgentRunner:
 
         text = message.text or message.caption or ""
         content_type, content_hash, photo_path = await self._fingerprint(client, message)
+
+        # Resolve the sender's role (admin / bot / scam / user / me) and archive
+        # the message immediately - we keep EVERY message in a monitored group.
+        role = await self._sender_role(client, message.chat.id, bot_id, sender)
+        await repo.save_group_message(
+            bot_id,
+            message.chat.id,
+            {
+                "message_id": message.id,
+                "sender_id": sender.id,
+                "sender_name": self._display_name(sender),
+                "sender_username": sender.username or "",
+                "sender_role": role,
+                "tg_scam_flag": bool(getattr(sender, "is_scam", False)
+                                     or getattr(sender, "is_fake", False)),
+                "text": text,
+                "media_type": (message.media.value if message.media else ""),
+                "date": self._aware(message.date),
+            },
+        )
+
+        # Skip processing for admins/bots/self
+        if role in ("admin", "bot", "me"):
+            return
 
         try:
             # --- Stages 1 & 2 (cheap, no network) ------------------------- #
@@ -147,6 +376,7 @@ class AgentRunner:
                         userbot_id=bot_id,
                         spammer_id=sender.id,
                         spammer_username=sender.username or "",
+                        message_id=message.id,
                         action="flagged",
                         stage=verdict.stage,
                         detail=verdict.reason,
@@ -156,42 +386,118 @@ class AgentRunner:
             if not verdict.is_spam:
                 return  # clean message
 
-            # --- Confirmed spam: enforce ---------------------------------- #
-            await delete_and_ban(client, message.chat.id, message.id, sender.id)
-            await repo.record_action(
-                chat_id=message.chat.id,
-                userbot_id=bot_id,
-                spammer_id=sender.id,
-                spammer_username=sender.username or "",
-                action="deleted_banned",
-                stage=verdict.stage,
-                detail=verdict.reason,
-            )
+            # --- Confirmed spam ------------------------------------------- #
+            # Mark the archived message's sender as scam.
+            await repo.set_group_message_role(bot_id, message.chat.id, message.id, "scam")
 
-            # Persist learning so future identical spam skips the AI entirely.
-            if verdict.should_cache:
-                await repo.add_to_blacklist(
-                    telegram_id=sender.id,
-                    username=sender.username or "",
-                    first_name=sender.first_name or "",
-                    reason=verdict.reason,
+            # Decide enforcement strategy:
+            # - Blacklisted users / known spam fingerprints: immediate ban
+            # - "Advertising" spam (free premium, etc.): 3-strike system
+            #   (account might be hacked, so delete msg only; ban on 3rd strike)
+            if verdict.stage in ("blacklist", "spam_cache"):
+                # Hardcore known spammers -> immediate ban (no strikes)
+                await self._enforce(client, message, bot_id, sender, verdict)
+            elif _is_ad_spam(text):
+                # Advertising spam -> 3-strike system
+                await self._enforce_with_strikes(
+                    client, message, bot_id, sender, verdict
                 )
-                if content_hash:
-                    await repo.cache_spam_content(
-                        content_type=content_type,
-                        content_hash=content_hash,
-                        raw_data=text,
-                    )
-
-            logger.info(
-                "BANNED %s in chat %s [%s] - %s",
-                sender.id, message.chat.id, verdict.stage, verdict.reason,
-            )
-            # Enforce - directly if admin, else fallback to helper/saved.
-            # _enforce also blacklists the user + caches the content hash.
-            await self._enforce(client, message, bot_id, sender, verdict)
+            else:
+                # Other confirmed spam (AI-detected scam bots, etc.) -> immediate ban
+                await self._enforce(client, message, bot_id, sender, verdict)
         finally:
             self._cleanup(photo_path)
+
+    async def _enforce_with_strikes(
+        self, client, message, bot_id, sender, verdict
+    ) -> None:
+        """
+        3-strike enforcement for advertising spam.
+
+        Strike 1 & 2: Delete the message only (account might be hacked).
+        Strike 3: Delete message + ban user + remove from group.
+
+        Strikes reset after 24 hours of no spam from the same user.
+        """
+        chat_id = message.chat.id
+        text = message.text or message.caption or ""
+        cfg = await repo.group_config(bot_id, chat_id)
+        group_id = cfg.get("group_id", 0) if cfg else 0
+
+        # Increment strike counter
+        strike_info = await repo.increment_strike(
+            group_id=group_id,
+            chat_id=chat_id,
+            user_id=sender.id,
+            username=sender.username or "",
+            first_name=sender.first_name or "",
+        )
+
+        strike_count = strike_info["strike_count"]
+        should_ban = strike_info["should_ban"]
+
+        if should_ban:
+            # 3rd strike -> full ban (same as _enforce)
+            logger.info(
+                "STRIKE 3 - BANNING %s in chat %s", sender.id, chat_id
+            )
+            # Add to blacklist
+            await repo.add_to_blacklist(
+                telegram_id=sender.id,
+                username=sender.username or "",
+                first_name=sender.first_name or "",
+                reason=f"3-strike ban: {verdict.reason}",
+            )
+            # Cache content
+            from .hashing import text_hash as _th
+            content_hash = _th(text) if text.strip() else None
+            if content_hash:
+                await repo.cache_spam_content(
+                    content_type="text", content_hash=content_hash, raw_data=text,
+                )
+            # Delete + ban
+            try:
+                await delete_and_ban(client, chat_id, message.id, sender.id)
+                await repo.record_action(
+                    chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
+                    spammer_username=sender.username or "", message_id=message.id,
+                    action="strike_ban",
+                    stage=verdict.stage,
+                    detail=f"Strike {strike_count}/3 -> BANNED: {verdict.reason}",
+                )
+            except ChatAdminRequired:
+                await repo.record_action(
+                    chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
+                    spammer_username=sender.username or "", message_id=message.id,
+                    action="strike_ban",
+                    stage=verdict.stage,
+                    detail=f"Strike {strike_count}/3 -> BAN FAILED (not admin): {verdict.reason}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Strike ban failed for %s: %s", sender.id, exc)
+        else:
+            # Strike 1 or 2 -> delete message only, warn
+            logger.info(
+                "STRIKE %d/3 for %s in chat %s - deleting message only",
+                strike_count, sender.id, chat_id,
+            )
+            try:
+                await safe_call(
+                    lambda: client.delete_messages(chat_id, message.id),
+                    what="delete_strike_msg",
+                )
+            except ChatAdminRequired:
+                logger.warning("Cannot delete message (not admin) in chat %s", chat_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to delete strike msg: %s", exc)
+
+            await repo.record_action(
+                chat_id=chat_id, userbot_id=bot_id, spammer_id=sender.id,
+                spammer_username=sender.username or "", message_id=message.id,
+                action="strike_warn",
+                stage=verdict.stage,
+                detail=f"Strike {strike_count}/3 - msg deleted (possible hacked account): {verdict.reason}",
+            )
 
     async def _enforce(self, client, message, bot_id, sender, verdict) -> None:
         chat_id = message.chat.id

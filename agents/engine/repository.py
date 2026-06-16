@@ -65,6 +65,7 @@ def record_action(
     action: str,
     stage: str,
     detail: str,
+    message_id: int | None = None,
 ) -> None:
     from agents.models import SecurityLog, TelegramGroup
 
@@ -76,6 +77,7 @@ def record_action(
         handled_by_id=userbot_id,
         spammer_id=spammer_id,
         spammer_username=spammer_username or "",
+        message_id=message_id,
         action_taken=action,
         stage=stage,
         detail=detail[:500],
