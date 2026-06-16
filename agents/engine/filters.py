@@ -43,6 +43,12 @@ DEFAULT_KEYWORDS = [
     "profile", "click here", "click", "free", "gift", "prize", "private",
     "onlyfans", "dating", "hot", "sexy", "видео", "профиль", "подпис",
     "переходи", "ссылк", "бесплатно", "интим", "эротик",
+    # Telegram Premium / phishing scam keywords
+    "premium", "tekin premium", "bepul premium", "premium sovg'a",
+    "premium olish", "premium beradi", "premium taqdim", "aksiya",
+    "получи premium", "бесплатный premium", "раздача",
+    "free premium", "get premium", "claim premium", "giveaway",
+    "промокод", "promo", "промо", "yutuq", "yutib ol",
 ]
 
 DEFAULT_EMOJIS = ["💋", "🔞", "💦", "🍑", "🍆", "👅", "😈", "🥵", "🔥"]
@@ -202,8 +208,37 @@ async def precheck(
 
 async def ai_decide(*, text: str, bio: str = "", photo_path: str | None = None,
                     stage2_reason: str = "") -> Verdict:
-    """Stage 3 only - call the AI with the enriched context."""
-    verdict_word = await classifier().classify(text=text, bio=bio, photo_path=photo_path)
+    """
+    Stage 3 - call the AI with the enriched context.
+
+    If the AI classifier is disabled (no API key), fall back to heuristic:
+    - If stage-2 found MULTIPLE signals (keyword+emoji, keyword+regex, etc.) -> SPAM
+    - If stage-2 found only one weak signal -> SAFE (avoid false positives)
+    """
+    clf = classifier()
+
+    if not clf.enabled:
+        # AI not available — use heuristic fallback based on stage-2 signals.
+        # Multiple distinct signals = high confidence of spam.
+        signals = [s.strip() for s in stage2_reason.replace("stage2:", "").split(",") if s.strip()]
+        if len(signals) >= 2:
+            # Two or more independent signals = treat as spam
+            return Verdict(
+                True, "heuristic",
+                reason=f"AI disabled, multi-signal heuristic ({stage2_reason})",
+                should_cache=True,
+            )
+        # Single signal with keyword match AND link in text = very likely spam
+        if "keyword" in signals and ("t.me/" in text or "http" in text.lower()):
+            return Verdict(
+                True, "heuristic",
+                reason=f"AI disabled, keyword+link heuristic ({stage2_reason})",
+                should_cache=True,
+            )
+        # Single signal only = not enough confidence, let it pass
+        return Verdict(False, "heuristic", reason=f"AI disabled, weak signal ({stage2_reason})")
+
+    verdict_word = await clf.classify(text=text, bio=bio, photo_path=photo_path)
     if verdict_word == "SPAM_BOT":
         return Verdict(
             True, "ai", reason=f"AI=SPAM_BOT ({stage2_reason})", should_cache=True
