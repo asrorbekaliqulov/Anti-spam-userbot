@@ -29,6 +29,34 @@
   </div>
 </div>
 
+<!-- New: Join Scan & Strike stats -->
+<div class="row g-3 mb-4">
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-person-check me-1"></i>Joins Scanned Today</div>
+      <div class="num text-info">{{ joins_scanned_today }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-person-x me-1"></i>Joins Banned (NSFW)</div>
+      <div class="num text-danger">{{ joins_banned_today }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-exclamation-triangle me-1"></i>Strike Warnings Today</div>
+      <div class="num text-warning">{{ strikes_today }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-x-octagon me-1"></i>Strike Bans Today</div>
+      <div class="num text-danger">{{ strike_bans_today }}</div>
+    </div>
+  </div>
+</div>
+
 <div class="row g-3">
   <div class="col-lg-8">
     <div class="card p-3 h-100">

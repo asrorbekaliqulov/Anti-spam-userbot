@@ -34,6 +34,8 @@
         <li class="nav-item"><a class="nav-link {% if active == 'userbots' %}active{% endif %}" href="{% url 'agents:userbots' %}"><i class="bi bi-robot me-2"></i>Agents (Userbots)</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'chats' %}active{% endif %}" href="{% url 'agents:chats' %}"><i class="bi bi-chat-dots me-2"></i>Chats</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'logs' %}active{% endif %}" href="{% url 'agents:logs' %}"><i class="bi bi-card-list me-2"></i>Security Logs</a></li>
+        <li class="nav-item"><a class="nav-link {% if active == 'join_events' %}active{% endif %}" href="{% url 'agents:join_events' %}"><i class="bi bi-person-check me-2"></i>Join Events</a></li>
+        <li class="nav-item"><a class="nav-link {% if active == 'strikes' %}active{% endif %}" href="{% url 'agents:strikes' %}"><i class="bi bi-exclamation-triangle me-2"></i>Strikes</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'filters' %}active{% endif %}" href="{% url 'agents:filters' %}"><i class="bi bi-funnel me-2"></i>Filter Rules</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'propagation' %}active{% endif %}" href="{% url 'agents:propagation' %}"><i class="bi bi-diagram-3 me-2"></i>Propagation</a></li>
         <li class="nav-item"><a class="nav-link {% if active == 'qr_add' %}active{% endif %}" href="{% url 'agents:qr_add' %}"><i class="bi bi-qr-code me-2"></i>Add Userbot</a></li>

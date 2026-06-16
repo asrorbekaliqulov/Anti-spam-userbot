@@ -1,0 +1,106 @@
+{% extends "agents/base.html" %}
+{% block title %}Strikes - AntiSpam Agents{% endblock %}
+{% block heading %}3-Strike System{% endblock %}
+{% block content %}
+<div class="row g-3 mb-4">
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-exclamation-triangle me-1"></i>Active Strikes</div>
+      <div class="num text-warning" id="stat-active">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-x-octagon me-1"></i>Total Banned (3 strikes)</div>
+      <div class="num text-danger" id="stat-banned">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-bell me-1"></i>Warnings Today</div>
+      <div class="num text-info" id="stat-warnings">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-hammer me-1"></i>Bans Today</div>
+      <div class="num text-danger" id="stat-bans">0</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="mb-2">
+    <h6 class="text-secondary mb-0"><i class="bi bi-info-circle me-1"></i> How it works</h6>
+  </div>
+  <p class="text-secondary small mb-0">
+    Advertising spam (free Telegram Premium, phishing links, etc.) uses a 3-strike system.
+    The sender's account may be hacked, so we only <strong>delete the message</strong> on strikes 1 &amp; 2.
+    On the <strong>3rd strike within 24 hours</strong>, the user is banned and removed from the group.
+    Strikes reset after 24h of no spam from the same user.
+  </p>
+</div>
+
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <span class="text-secondary small"><i class="bi bi-broadcast text-success"></i> auto-refreshing every 3s</span>
+    <span id="rowcount" class="badge text-bg-secondary">0 records</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle text-light">
+      <thead class="text-secondary">
+        <tr>
+          <th>Group</th><th>User</th><th>Username</th>
+          <th>Strikes</th><th>Status</th><th>Last Strike</th>
+        </tr>
+      </thead>
+      <tbody id="strikebody">
+        <tr><td colspan="6" class="text-center text-secondary py-4">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function strikeBadge(count, banned){
+  if(banned) return `<span class="badge text-bg-danger">${count}/3 BANNED</span>`;
+  if(count >= 2) return `<span class="badge text-bg-warning">${count}/3</span>`;
+  return `<span class="badge text-bg-info">${count}/3</span>`;
+}
+function statusBadge(banned){
+  return banned
+    ? '<span class="badge text-bg-danger">Banned</span>'
+    : '<span class="badge text-bg-warning">Warning</span>';
+}
+async function loadStrikes(){
+  try {
+    const res = await fetch("{% url 'agents:api_strikes' %}");
+    const data = await res.json();
+    const body = document.getElementById('strikebody');
+    document.getElementById('rowcount').textContent = data.strikes.length + ' records';
+    document.getElementById('stat-active').textContent = data.stats.active_strikes;
+    document.getElementById('stat-banned').textContent = data.stats.total_banned;
+    document.getElementById('stat-warnings').textContent = data.stats.warnings_today;
+    document.getElementById('stat-bans').textContent = data.stats.bans_today;
+
+    if(!data.strikes.length){
+      body.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">No strikes recorded yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = data.strikes.map(r => `
+      <tr>
+        <td>${r.group}</td>
+        <td>${r.first_name} <small class="text-muted">(${r.user_id})</small></td>
+        <td class="text-info">${r.username !== '-' ? '@'+r.username : '-'}</td>
+        <td>${strikeBadge(r.strike_count, r.is_banned)}</td>
+        <td>${statusBadge(r.is_banned)}</td>
+        <td class="text-nowrap small">${r.last_strike_at}</td>
+      </tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+loadStrikes();
+setInterval(loadStrikes, 3000);
+</script>
+{% endblock %}

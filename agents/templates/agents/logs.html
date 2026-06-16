@@ -26,13 +26,22 @@
 {% block scripts %}
 <script>
 function stageBadge(stage){
-  const map = {blacklist:'danger', spam_cache:'warning', regex:'info', ai:'primary'};
+  const map = {
+    blacklist:'danger', spam_cache:'warning', regex:'info', ai:'primary',
+    profile_scan:'purple'
+  };
   const cls = map[stage] || 'secondary';
   return `<span class="badge badge-stage text-bg-${cls}">${stage||'-'}</span>`;
 }
 function actionBadge(a){
-  const danger = a.toLowerCase().includes('ban');
-  return `<span class="badge text-bg-${danger?'danger':'secondary'}">${a}</span>`;
+  const lower = a.toLowerCase();
+  let cls = 'secondary';
+  if(lower.includes('ban')) cls = 'danger';
+  else if(lower.includes('strike warning') || lower.includes('strike warn')) cls = 'warning';
+  else if(lower.includes('allowed') || lower.includes('clean')) cls = 'success';
+  else if(lower.includes('flag')) cls = 'info';
+  else if(lower.includes('reported')) cls = 'primary';
+  return `<span class="badge text-bg-${cls}">${a}</span>`;
 }
 async function loadLogs(){
   try {
@@ -52,7 +61,7 @@ async function loadLogs(){
         <td class="text-warning">${r.spammer}</td>
         <td>${actionBadge(r.action)}</td>
         <td>${stageBadge(r.stage)}</td>
-        <td class="small text-secondary">${r.detail}</td>
+        <td class="small text-secondary" style="max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.detail}">${r.detail}</td>
       </tr>`).join('');
   } catch(e){ console.error(e); }
 }

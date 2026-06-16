@@ -1,0 +1,96 @@
+{% extends "agents/base.html" %}
+{% block title %}Join Events - AntiSpam Agents{% endblock %}
+{% block heading %}Join Events (Profile Scan Log){% endblock %}
+{% block content %}
+<div class="row g-3 mb-4">
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-person-check me-1"></i>Scanned Today</div>
+      <div class="num text-info" id="stat-total">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-shield-check me-1"></i>Clean</div>
+      <div class="num text-success" id="stat-clean">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-exclamation-diamond me-1"></i>NSFW Detected</div>
+      <div class="num text-warning" id="stat-nsfw">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-lg-3">
+    <div class="stat-card p-3">
+      <div class="text-secondary small"><i class="bi bi-person-x me-1"></i>Banned</div>
+      <div class="num text-danger" id="stat-banned">0</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <span class="text-secondary small"><i class="bi bi-broadcast text-success"></i> auto-refreshing every 3s</span>
+    <span id="rowcount" class="badge text-bg-secondary">0 events</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle text-light">
+      <thead class="text-secondary">
+        <tr>
+          <th>Time</th><th>Group</th><th>User</th><th>Username</th>
+          <th>Scan Result</th><th>Action</th><th>Detail</th>
+        </tr>
+      </thead>
+      <tbody id="eventbody">
+        <tr><td colspan="7" class="text-center text-secondary py-4">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function scanBadge(raw, display){
+  const map = {clean:'success', nsfw_photo:'danger', nsfw_channel:'warning', nsfw_both:'danger', scan_failed:'secondary'};
+  const cls = map[raw] || 'secondary';
+  return `<span class="badge text-bg-${cls}">${display}</span>`;
+}
+function actionBadge(raw, display){
+  const map = {banned:'danger', allowed:'success', monitoring:'warning'};
+  const cls = map[raw] || 'secondary';
+  return `<span class="badge text-bg-${cls}">${display}</span>`;
+}
+async function loadEvents(){
+  try {
+    const res = await fetch("{% url 'agents:api_join_events' %}");
+    const data = await res.json();
+    const body = document.getElementById('eventbody');
+    document.getElementById('rowcount').textContent = data.events.length + ' events';
+    // Update stats
+    document.getElementById('stat-total').textContent = data.stats.total_today;
+    document.getElementById('stat-clean').textContent = data.stats.clean_today;
+    document.getElementById('stat-nsfw').textContent = data.stats.nsfw_today;
+    document.getElementById('stat-banned').textContent = data.stats.banned_today;
+
+    if(!data.events.length){
+      body.innerHTML = '<tr><td colspan="7" class="text-center text-secondary py-4">No join events yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = data.events.map(r => `
+      <tr>
+        <td class="text-nowrap small">${r.timestamp}</td>
+        <td>${r.group}</td>
+        <td>${r.first_name} <small class="text-muted">(${r.user_id})</small></td>
+        <td class="text-info">${r.username !== '-' ? '@'+r.username : '-'}</td>
+        <td>${scanBadge(r.scan_result_raw, r.scan_result)}</td>
+        <td>${actionBadge(r.action_raw, r.action)}</td>
+        <td class="small text-secondary" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.detail}">${r.detail}</td>
+      </tr>`).join('');
+  } catch(e){ console.error(e); }
+}
+loadEvents();
+setInterval(loadEvents, 3000);
+</script>
+{% endblock %}
