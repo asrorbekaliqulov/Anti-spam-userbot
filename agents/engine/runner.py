@@ -259,13 +259,15 @@ class AgentRunner:
         """
         Handle ChatMemberUpdated events - detect new members joining monitored groups.
 
+        Works for ALL group sizes. In supergroups (most groups with >200 members)
+        Telegram sends ChatMemberUpdated instead of new_chat_members service messages.
+
         Scans the new member's profile for NSFW content:
-          - Profile photos checked for 18+ imagery
+          - Profile photos checked for 18+ imagery via AI
           - Bio checked for linked channels with adult content
 
         If NSFW content is found: immediately ban and remove the user.
         """
-        # Only process join events (new_chat_member status change)
         if not update.chat:
             return
         chat_id = update.chat.id
@@ -274,31 +276,46 @@ class AgentRunner:
         if not await self._is_monitored(bot_id, chat_id):
             return
 
-        # Check if this is a "join" event
-        new_member = update.new_chat_member
-        old_member = update.old_chat_member
+        # Get new and old member info
+        new_member = getattr(update, "new_chat_member", None)
+        old_member = getattr(update, "old_chat_member", None)
 
-        if not new_member or not new_member.user:
+        if not new_member:
             return
 
-        user = new_member.user
+        # In Pyrogram 2.x, new_chat_member can be a ChatMember object
+        # The user is either new_member.user or the update itself may carry it
+        user = getattr(new_member, "user", None)
+        if not user:
+            return
 
-        # Skip bots, self, and admins
-        if user.is_bot:
+        # Skip bots and self
+        if getattr(user, "is_bot", False):
             return
         if user.id == self._self_ids.get(bot_id):
             return
 
-        # Determine if this is actually a NEW join (was not a member before)
+        # Determine if this is actually a NEW join
+        # Accept: member/restricted status when old was left/banned/None
+        new_status = getattr(new_member, "status", None)
+        old_status = getattr(old_member, "status", None) if old_member else None
+
         is_new_join = False
-        new_status = new_member.status
-        if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED):
-            if old_member is None:
+        # New status is member or restricted (joined the group)
+        if new_status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.RESTRICTED,
+        ):
+            # Old status was not in group
+            if old_status is None:
                 is_new_join = True
-            elif old_member.status in (
+            elif old_status in (
                 ChatMemberStatus.LEFT,
                 ChatMemberStatus.BANNED,
             ):
+                is_new_join = True
+            # Edge case: old_member exists but has no status attr
+            elif old_member and not old_status:
                 is_new_join = True
 
         if not is_new_join:
@@ -457,6 +474,18 @@ class AgentRunner:
                 content_type=content_type,
                 content_hash=content_hash,
             )
+
+            # --- Force AI check for ANY message containing a link ---------- #
+            # Even if stage-2 says "clean", if there's a link we escalate
+            # to AI to verify it's not phishing/scam.
+            has_link = bool(
+                text and ("t.me/" in text or "http" in text.lower()
+                          or "telegram.me/" in text.lower())
+            )
+            if not verdict.is_spam and not verdict.needs_ai and has_link:
+                # Override: escalate to AI for link verification
+                verdict.needs_ai = True
+                verdict.reason = verdict.reason or "stage2: link_detected"
 
             # --- Stage 3 escalation: enrich with bio + profile photo ------ #
             if verdict.needs_ai:

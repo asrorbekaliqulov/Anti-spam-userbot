@@ -213,29 +213,42 @@ async def ai_decide(*, text: str, bio: str = "", photo_path: str | None = None,
 
     If the AI classifier is disabled (no API key), fall back to heuristic:
     - If stage-2 found MULTIPLE signals (keyword+emoji, keyword+regex, etc.) -> SPAM
-    - If stage-2 found only one weak signal -> SAFE (avoid false positives)
+    - If a link is present AND any keyword matched -> SPAM (likely phishing)
+    - If only a link is present with no other signal -> SAFE (normal link sharing)
     """
     clf = classifier()
 
     if not clf.enabled:
         # AI not available — use heuristic fallback based on stage-2 signals.
-        # Multiple distinct signals = high confidence of spam.
         signals = [s.strip() for s in stage2_reason.replace("stage2:", "").split(",") if s.strip()]
+        has_link = bool("t.me/" in text or "http" in text.lower() or "telegram.me/" in text.lower())
+
+        # Multiple distinct signals = high confidence of spam
         if len(signals) >= 2:
-            # Two or more independent signals = treat as spam
             return Verdict(
                 True, "heuristic",
                 reason=f"AI disabled, multi-signal heuristic ({stage2_reason})",
                 should_cache=True,
             )
-        # Single signal with keyword match AND link in text = very likely spam
-        if "keyword" in signals and ("t.me/" in text or "http" in text.lower()):
+        # Keyword match + link = very likely phishing/scam
+        if "keyword" in signals and has_link:
             return Verdict(
                 True, "heuristic",
                 reason=f"AI disabled, keyword+link heuristic ({stage2_reason})",
                 should_cache=True,
             )
-        # Single signal only = not enough confidence, let it pass
+        # Adult emoji + link = likely adult scam
+        if "adult-emoji" in signals and has_link:
+            return Verdict(
+                True, "heuristic",
+                reason=f"AI disabled, emoji+link heuristic ({stage2_reason})",
+                should_cache=True,
+            )
+        # Only link detected (no keywords/emojis) = normal link, allow
+        if "link_detected" in stage2_reason and len(signals) <= 1:
+            return Verdict(False, "heuristic", reason=f"AI disabled, link only - allowed ({stage2_reason})")
+
+        # Single keyword signal without link = not enough confidence
         return Verdict(False, "heuristic", reason=f"AI disabled, weak signal ({stage2_reason})")
 
     verdict_word = await clf.classify(text=text, bio=bio, photo_path=photo_path)
