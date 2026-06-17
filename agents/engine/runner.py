@@ -80,12 +80,16 @@ class AgentRunner:
         self._running = False
         self._job_task: asyncio.Task | None = None
         self._cmd_task: asyncio.Task | None = None
+        self._join_poll_task: asyncio.Task | None = None
         # bot_id -> (set_of_chat_ids, loaded_at)
         self._monitor_cache: dict[int, tuple[set[int], float]] = {}
         # bot_id -> own telegram user id (to detect self / own admin rights)
         self._self_ids: dict[int, int] = {}
         # chat_id -> (set_of_admin_user_ids, loaded_at)
         self._admin_cache: dict[int, tuple[set[int], float]] = {}
+        # Track already-scanned user joins to avoid duplicates
+        # Key: (chat_id, user_id), Value: timestamp
+        self._scanned_joins: dict[tuple[int, int], float] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -94,9 +98,10 @@ class AgentRunner:
             logger.warning("No active userbots found. Add one via the dashboard QR flow.")
         for bot in bots:
             await self._start_one(bot)
-        # Background tasks: propagation jobs + dashboard read commands.
+        # Background tasks: propagation jobs + dashboard read commands + join polling.
         self._job_task = asyncio.ensure_future(self._job_loop())
         self._cmd_task = asyncio.ensure_future(self._command_loop())
+        self._join_poll_task = asyncio.ensure_future(self._join_poll_loop())
         logger.info("Agent runner online with %d userbot(s).", len(self.clients))
 
     async def _is_monitored(self, bot_id: int, chat_id: int) -> bool:
@@ -213,6 +218,13 @@ class AgentRunner:
                 user.id, user.username or user.first_name, chat_id,
             )
 
+            # Deduplication: skip if already scanned recently
+            join_key = (chat_id, user.id)
+            now = time.time()
+            if now - self._scanned_joins.get(join_key, 0) < 300:
+                continue
+            self._scanned_joins[join_key] = now
+
             # Check if already blacklisted
             if await repo.is_blacklisted(user.id):
                 await self._ban_new_member(
@@ -325,6 +337,13 @@ class AgentRunner:
             "New member join: %s (%s) in chat %s",
             user.id, user.username or user.first_name, chat_id,
         )
+
+        # Deduplication: skip if already scanned recently
+        join_key = (chat_id, user.id)
+        now = time.time()
+        if now - self._scanned_joins.get(join_key, 0) < 300:
+            return
+        self._scanned_joins[join_key] = now
 
         # Check if already blacklisted - immediate ban
         if await repo.is_blacklisted(user.id):
@@ -910,11 +929,171 @@ class AgentRunner:
             self._job_task.cancel()
         if self._cmd_task:
             self._cmd_task.cancel()
+        if self._join_poll_task:
+            self._join_poll_task.cancel()
         for client in self.clients.values():
             try:
                 await client.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ----------------------------------------------------------------------- #
+    #  Join polling: periodically check Recent Actions for new members
+    #  This catches joins in large supergroups where event handlers may not fire
+    # ----------------------------------------------------------------------- #
+    async def _join_poll_loop(self) -> None:
+        """
+        Poll get_chat_event_log (Recent Actions) for new member joins.
+
+        Supergroups (especially 200+ members) don't always send
+        ChatMemberUpdated or new_chat_members events to userbots.
+        This loop checks the admin log every 10 seconds for new joins
+        that might have been missed by the event handlers.
+
+        Requires admin rights in the group to access event log.
+        """
+        # Wait a bit for clients to fully start
+        await asyncio.sleep(15)
+        while self._running:
+            try:
+                for bot_id, client in list(self.clients.items()):
+                    chat_ids = list(
+                        self._monitor_cache.get(bot_id, (set(), 0))[0]
+                    )
+                    if not chat_ids:
+                        # Refresh cache
+                        chat_ids = await repo.monitored_chat_ids(bot_id)
+                    for chat_id in chat_ids:
+                        await self._poll_recent_joins(client, bot_id, chat_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("join poll loop error: %s", exc)
+            await asyncio.sleep(10)
+
+    async def _poll_recent_joins(
+        self, client: Client, bot_id: int, chat_id: int
+    ) -> None:
+        """Check Recent Actions for new member joins in a single chat."""
+        try:
+            events = []
+            async for event in client.get_chat_event_log(
+                chat_id, limit=20
+            ):
+                # Filter only "new_members" events
+                if not event:
+                    continue
+                # In Pyrogram, event log entries have different action types
+                # We look for member join actions
+                action = getattr(event, "action", None)
+                if not action:
+                    continue
+
+                # Check if this is a member joined/added event
+                # Pyrogram ChatEvent has: new_member_join, added_members, etc.
+                new_member = None
+                if hasattr(action, "new_member"):
+                    new_member = action.new_member
+                elif hasattr(action, "members"):
+                    # added_members event
+                    members = action.members
+                    if members:
+                        for m in members:
+                            user = getattr(m, "user", m)
+                            if user:
+                                await self._check_polled_join(
+                                    client, bot_id, chat_id, user
+                                )
+                    continue
+
+                if new_member:
+                    user = getattr(new_member, "user", new_member)
+                    if user:
+                        await self._check_polled_join(
+                            client, bot_id, chat_id, user
+                        )
+
+        except Exception:  # noqa: BLE001
+            # Not admin or other error - silently skip
+            pass
+
+    async def _check_polled_join(
+        self, client: Client, bot_id: int, chat_id: int, user
+    ) -> None:
+        """Process a single join found via polling (deduplication + scan)."""
+        if not user:
+            return
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            return
+
+        # Skip bots and self
+        if getattr(user, "is_bot", False):
+            return
+        if user_id == self._self_ids.get(bot_id):
+            return
+
+        # Deduplication: skip if already scanned recently (within 5 minutes)
+        key = (chat_id, user_id)
+        now = time.time()
+        last_scan = self._scanned_joins.get(key, 0)
+        if now - last_scan < 300:  # 5 minutes
+            return
+
+        # Mark as scanned
+        self._scanned_joins[key] = now
+
+        # Clean old entries (older than 10 minutes) to prevent memory leak
+        if len(self._scanned_joins) > 5000:
+            cutoff = now - 600
+            self._scanned_joins = {
+                k: v for k, v in self._scanned_joins.items() if v > cutoff
+            }
+
+        logger.info(
+            "Join detected via polling: %s (%s) in chat %s",
+            user_id, getattr(user, "username", "") or getattr(user, "first_name", ""),
+            chat_id,
+        )
+
+        # Check if already blacklisted
+        if await repo.is_blacklisted(user_id):
+            await self._ban_new_member(
+                client, chat_id, bot_id, user,
+                scan_result="nsfw_photo",
+                detail="User already on blacklist (detected via polling)",
+            )
+            return
+
+        # Run full profile scan
+        profile_scanner = get_scanner()
+        scan_result, detail = await profile_scanner.full_scan(client, user_id)
+
+        if scan_result == "clean":
+            await repo.record_join_event(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                user_id=user_id,
+                username=getattr(user, "username", "") or "",
+                first_name=getattr(user, "first_name", "") or "",
+                bio="",
+                scan_result="clean",
+                action_taken="allowed",
+                detail=f"(polled) {detail}",
+            )
+            await repo.record_action(
+                chat_id=chat_id,
+                userbot_id=bot_id,
+                spammer_id=user_id,
+                spammer_username=getattr(user, "username", "") or "",
+                action="join_allowed",
+                stage="profile_scan",
+                detail=f"Clean profile (polled): {detail}",
+            )
+        else:
+            await self._ban_new_member(
+                client, chat_id, bot_id, user,
+                scan_result=scan_result,
+                detail=f"(polled) {detail}",
+            )
 
     # ----------------------------------------------------------------------- #
     #  Dashboard read commands (sync chat list / fetch history)
